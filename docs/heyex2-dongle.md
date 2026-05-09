@@ -1,0 +1,217 @@
+# HEYEX 2 Dongle Bridge — Marx CryptoBox CBU via Tailscale + VirtualHere
+
+This document describes how the physical **Marx Crypto Box CBU** USB license dongle
+(supplied by Heidelberg Engineering) is bridged from a local Windows 11 PC to the
+cloud-hosted **Heyex2-testing** EC2 (`i-02a7dd1797d85a099`, Windows Server 2019)
+using **Tailscale** (private mesh VPN) and **VirtualHere** (USB-over-IP).
+
+This is required because the EC2 has no physical USB port, but HEYEX 2 v2.6.10
+requires the dongle to be locally attached in order to activate its license.
+
+---
+
+## Architecture
+
+```
+Local Windows 11 PC (Raimondo)          EC2: Heyex2-testing (AWS eu-west-1)
+┌─────────────────────────────┐         ┌────────────────────────────────────┐
+│  Marx Crypto Box CBU        │         │  VirtualHere Client v5.9.8         │
+│  USB port → red LED (idle)  │         │  (vhui64.exe, Session 2 / RDP)     │
+│  Driver: CBUSetup_Oct2025   │         │  Config: vhui.ini                  │
+│                             │   TCP   │  Server: 100.64.25.24:7575         │
+│  VirtualHere USB Server     │◄───────►│  Autouse: USB CrypToken            │
+│  (vhusbdwin64.exe, service) │ 7575    │                                    │
+│  Tailscale IP: 100.64.25.24 │         │  Tailscale IP: 100.79.248.90       │
+│  Firewall: TCP 7575 open    │         │  Marx driver: cbu2_64.inf (oem10)  │
+└─────────────────────────────┘         │              cbusb_64.inf (oem8)   │
+                                        │                                    │
+                                        │  HELICSVC: Heidelberg Eye Explorer │
+                                        │  License Manager — reads dongle    │
+                                        └────────────────────────────────────┘
+```
+
+---
+
+## Component Details
+
+### Local PC (USB server side)
+
+| Item | Detail |
+|------|--------|
+| OS | Windows 11 Pro |
+| Tailscale IP | `100.64.25.24` |
+| VirtualHere Server | `C:\VirtualHere\vhusbdwin64.exe` — runs as Windows service `VirtualHere USB Server` |
+| Marx driver | `CBUSetup_13Oct2025.zip` from https://www.marx.com/downloads/drivers-and-diagnostic/cbusetup/CBUSetup_13Oct2025.zip |
+| Dongle | Marx Crypto Box CBU — LED: **red** = idle/ready, **green** = HEYEX 2 actively reading |
+| Firewall | Inbound TCP 7575 open |
+
+### EC2 (USB client side)
+
+| Item | Detail |
+|------|--------|
+| Instance | `i-02a7dd1797d85a099` — Heyex2-testing |
+| Tailscale IP | `100.79.248.90` |
+| VirtualHere Client | `C:\VirtualHere\vhui64.exe` v5.9.8 |
+| VH config file | `C:\Users\Administrator\AppData\Roaming\vhui.ini` (**not** `client.ini`) |
+| Marx drivers | `oem8.inf` (cbusb_64.inf) + `oem10.inf` (cbu2_64.inf) — installed by HEYEX 2 setup |
+| Device (when forwarded) | `CBUSB Ver 2.0`, VID_0D7A&PID_0001, Status: OK |
+| License Manager service | `HELICSVC` — Heidelberg Eye Explorer License Manager |
+
+---
+
+## VirtualHere Config (`vhui.ini`)
+
+Location on EC2: `C:\Users\Administrator\AppData\Roaming\vhui.ini`
+
+```ini
+[SERVERS]
+SERVER=100.64.25.24:7575
+
+[AUTOUSE]
+USB CrypToken=1
+```
+
+> **Important**: VirtualHere Client 5.x on Windows uses `vhui.ini` — NOT `client.ini`.
+> Earlier attempts used `client.ini` which was silently ignored.
+
+---
+
+## How to Start a Session (SOP)
+
+### Prerequisites
+- Local PC is on and Tailscale is running (`tailscale status` shows `100.64.25.24 msi`)
+- Marx dongle is plugged into the local PC (LED = red)
+- VirtualHere USB Server service is running on local PC
+- EC2 `Heyex2-testing` is started and SSM is Online
+
+### Steps
+
+1. **RDP into the EC2**: `54.154.242.69` → user `Administrator`
+
+2. **Launch VirtualHere client** in your RDP session:
+   ```
+   C:\VirtualHere\vhui64.exe
+   ```
+   The client will auto-connect to `100.64.25.24:7575` and auto-use `USB CrypToken`.
+
+3. **Verify in VH client tree**: You should see:
+   ```
+   USB Servers
+   └─ Windows Hub (green dot)
+      └─ USB CrypToken (In use by you)   ← highlighted blue
+   ```
+
+4. **Restart License Manager** (if HEYEX 2 was already running, or after EC2 reboot):
+   ```powershell
+   Restart-Service HELICSVC
+   ```
+   Or via SSM from the backend EC2:
+   ```bash
+   aws ssm send-command --instance-ids i-02a7dd1797d85a099 \
+     --document-name AWS-RunPowerShellScript \
+     --parameters 'commands=["Restart-Service HELICSVC"]' \
+     --region eu-west-1
+   ```
+
+5. **Activate license via License Manager UI**:
+   - Look in system tray (bottom-right) for the Heidelberg Eye Explorer License Manager icon
+   - Click it → click the **"Marx Crypto Box CBU"** image
+   - Screen refreshes showing active license
+
+6. **Launch HEYEX 2** from the desktop or Start menu
+   - Login: `sysadmin` / `hesmc`
+
+---
+
+## Troubleshooting
+
+### VH client shows "USB Servers" but nothing under it (empty tree)
+**Cause**: VH client launched in Session 0 (SSM/system session) instead of the
+interactive RDP session. Session 0 cannot forward USB devices.
+
+**Fix**: Make sure you launch `vhui64.exe` directly in your RDP session (double-click
+the exe, or use the scheduled task). Do NOT rely on SSM's `Start-Process` to launch it.
+
+### VH client tree completely empty (no "Windows Hub" entry)
+**Cause**: Client is not connecting to the server — either Tailscale is down, firewall
+blocking port 7575, or the VH server service stopped on the local PC.
+
+**Check**:
+```powershell
+# On EC2 (via SSM):
+Test-NetConnection -ComputerName 100.64.25.24 -Port 7575
+# Should return TcpTestSucceeded: True
+```
+
+**Fix**:
+- Restart Tailscale on local PC
+- Restart VirtualHere USB Server service on local PC (`services.msc`)
+- Check Windows Firewall on local PC — inbound TCP 7575 must be open
+
+### Dongle LED stays red (not green) after HEYEX 2 starts
+This is normal during HEYEX 2 startup. The LED turns green when HEYEX 2 actively
+queries the dongle for license info (typically within 10–30 seconds of login).
+
+### HEYEX 2 shows "No valid license" or license expired
+1. Check dongle is still "In use by you" in VH client
+2. `Restart-Service HELICSVC`
+3. In License Manager tray → click "Marx Crypto Box CBU" again
+
+### After EC2 reboot — VH client not auto-starting in user session
+The scheduled task `VirtualHereClient` is configured to run at logon for Administrator.
+It should start automatically when you RDP in. If it doesn't:
+1. Check Task Scheduler → VirtualHereClient → Last Run Result
+2. Manually run: `C:\VirtualHere\vhui64.exe`
+
+---
+
+## Scheduled Task for VH Client (Auto-start at RDP logon)
+
+Created via SSM. Task name: `VirtualHereClient`
+
+```
+Trigger:    At log on of Administrator
+Action:     C:\VirtualHere\vhui64.exe
+Run Level:  Highest
+```
+
+On each RDP login, this launches `vhui64.exe` in the interactive session,
+which reads `vhui.ini`, connects to `100.64.25.24:7575`, and auto-uses the dongle.
+
+---
+
+## Key Lessons Learned
+
+1. **Wrong vendor investigated**: The dongle is a **Marx CryptoBox CBU** (not Thales/Sentinel HASP).
+   Confirmed by Windows device name "USB CrypToken" and Klaus Brönnimann (Heidelberg) email.
+   The correct driver is `CBUSetup.exe` from **marx.com/en/support/downloads**, not `HASPUserSetup.exe`.
+
+2. **Driver already on EC2**: The HEYEX 2 installer bundles the Marx CBU driver
+   (`cbu2_64.inf`, `cbusb_64.inf`) — no separate install needed on the machine running HEYEX 2.
+
+3. **Driver needed on local PC**: VirtualHere Server requires the USB device to be
+   properly enumerated by Windows (not just showing as "Other devices" yellow triangle).
+   Installing `CBUSetup.exe` on the local PC was required.
+
+4. **VH Client 5.x uses `vhui.ini`**: Earlier versions used `client.ini`.
+   All manual config written to `client.ini` was silently ignored.
+
+5. **Session 0 isolation**: SSM runs in Session 0; GUI apps launched via SSM's
+   `Start-Process` appear in Session 0 and cannot forward USB devices or display
+   windows in the user's RDP session (Session 2). Must use scheduled tasks with
+   `LogonType = Interactive` to launch in the user session.
+
+6. **`Specify USB Server...` menu item**: The correct way to add the hub manually
+   in the VH client GUI is: right-click the "USB Servers" node → Specify USB Server…
+   → enter `100.64.25.24` (port 7575).
+
+---
+
+## Verified
+
+- **2026-05-09 21:38 UTC** — Full end-to-end dongle bridge working:
+  - Local PC: Marx CBU driver installed, VH Server running, dongle LED = red (ready)
+  - EC2: VH Client v5.9.8 in RDP session, `USB CrypToken (In use by you)`
+  - EC2 Device Manager: `CBUSB Ver 2.0`, Status `OK`, `VID_0D7A&PID_0001`
+  - `HELICSVC` restarted; License Manager showed active Marx Crypto Box CBU license
+  - HEYEX 2 v2.6.10 launched successfully, logged in as `sysadmin`/`hesmc` ✓
