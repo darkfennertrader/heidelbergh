@@ -1,4 +1,4 @@
-# HEYEX 2 Dongle Bridge — Marx CryptoBox CBU via Tailscale + VirtualHere
+ # HEYEX 2 Dongle Bridge — Marx CryptoBox CBU via Tailscale + VirtualHere
 
 This document describes how the physical **Marx Crypto Box CBU** USB license dongle
 (supplied by Heidelberg Engineering) is bridged from a local Windows 11 PC to the
@@ -204,6 +204,42 @@ which reads `vhui.ini`, connects to `100.64.25.24:7575`, and auto-uses the dongl
 6. **`Specify USB Server...` menu item**: The correct way to add the hub manually
    in the VH client GUI is: right-click the "USB Servers" node → Specify USB Server…
    → enter `100.64.25.24` (port 7575).
+
+---
+
+## Cold-Start Steps (from everything off)
+
+### On your local Windows 11 PC
+
+1. **Turn on the PC** and log in.
+2. **Plug in the Marx Crypto Box CBU dongle** — LED should go **red** (ready).
+3. **Verify Tailscale is running** — look for the Tailscale icon in the system tray (bottom-right). If it's not there, open Tailscale from the Start menu and connect. Once signed in it auto-starts on boot.
+4. **Verify VirtualHere USB Server is running** — it's a Windows service that auto-starts on boot. To confirm: `Win+R` → `services.msc` → find **"VirtualHere USB Server"** → Status = **Running**. If not: right-click → **Start**.
+
+### Start the EC2
+
+5. Go to **AWS Console → EC2 → Instances → `Heyex2-testing`** → **Instance state → Start instance**.
+6. Wait ~2 minutes until **Instance State = Running** and **Status checks = 2/2 passed**.
+7. Note the **new Public IP** shown in the instance details — it changes every time you start the instance.
+
+### RDP in and bring the dongle online
+
+8. **RDP into the EC2**: open your RDP client → use the new Public IP → user `Administrator` → password (get it from EC2 Console → Connect → RDP client → Get password → paste `AppWay.pem`).
+9. Wait ~10 seconds after logging in. The scheduled task `VirtualHereClient` automatically launches `C:\VirtualHere\vhui64.exe` in your RDP session.
+10. **Check the VirtualHere client window** — under `USB Servers → Windows Hub` you should see **"USB CrypToken (In use by you)"** (highlighted blue).
+    - If it's **not there**: right-click **`USB Servers`** → **Specify USB Server…** → enter `100.64.25.24`, port `7575` → OK. Then right-click the dongle entry → **Use this device**.
+11. **Restart the License Manager** — open PowerShell as Administrator and run:
+    ```powershell
+    Restart-Service HELICSVC
+    ```
+12. **Activate the license** — look in the system tray (bottom-right, click `^` to expand). Click the **Heidelberg Eye Explorer License Manager** icon → click the **"Marx Crypto Box CBU"** image → the screen refreshes showing the active license.
+13. **Launch HEYEX 2** from the desktop or Start menu → login: `sysadmin` / `hesmc`.
+
+### Shutdown (when done)
+
+14. Close HEYEX 2.
+15. In AWS Console → EC2 → Heyex2-testing → **Instance state → Stop instance** (preserves data, saves cost).
+16. On your local PC: leave the dongle plugged in or unplug — either is fine. Tailscale and VirtualHere Server can stay running (near-zero resource use).
 
 ---
 
