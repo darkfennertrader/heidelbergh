@@ -319,6 +319,73 @@ which reads `vhui.ini`, connects to `100.97.57.68:7575`, and auto-uses the dongl
 
 ---
 
+## Loading Local Images into HEYEX 2 (RDP Drive Redirection)
+
+During an RDP session, your local Ubuntu folder is available **live** inside the Windows
+EC2 as a network path — no file copying needed. Drop a file on Ubuntu → it appears in
+Windows instantly.
+
+### Setup (one-time on your Ubuntu PC)
+
+```bash
+# 1. Install xfreerdp (free, open-source RDP client)
+sudo apt install -y freerdp2-x11
+
+# 2. Create the local images folder (if not already done)
+mkdir -p /home/ray/projects/heyex-test-images
+```
+
+### Launching RDP with the folder shared
+
+Use the `scripts/rdp-heyex.sh` script from this repo:
+
+```bash
+# Copy once to your local machine, then run:
+chmod +x rdp-heyex.sh
+./rdp-heyex.sh
+```
+
+Or run the `xfreerdp` command directly:
+
+```bash
+xfreerdp \
+  /v:54.154.242.69 \
+  /u:Administrator \
+  /size:1600x900 \
+  /dynamic-resolution \
+  /drive:heyex-images,/home/ray/projects/heyex-test-images \
+  /clipboard \
+  /cert:ignore
+```
+
+### Accessing the folder inside Windows
+
+Once connected, your Ubuntu folder appears as:
+- **`\\tsclient\heyex-images\`** — type this in any Windows "Open" / "Browse" dialog
+- **Desktop shortcut**: `HEYEX Images (Ubuntu).lnk` (pre-created on the EC2 Desktop)
+- **Documents shortcut**: same shortcut in `C:\Users\Administrator\Documents\`
+
+> **Note**: The shortcut points to `\\tsclient\heyex-images\` which only resolves during
+> an active RDP session where the drive redirection is enabled. If you open HEYEX 2
+> without launching via `rdp-heyex.sh`, the shortcut will not resolve.
+
+### Alternatively — Remmina GUI (same result, no terminal)
+
+1. Open Remmina → right-click your `54.154.242.69` connection → **Edit**
+2. Go to the **"Advanced"** tab
+3. Find **"Share folder"** → browse to `/home/ray/projects/heyex-test-images`
+4. **Save** and connect — Remmina remembers this setting forever
+5. Your folder appears as `heyex-test-images on AI-DEV` under **This PC → Redirected drives and folders**
+
+### Workflow
+
+1. Copy/drop your test images into `/home/ray/projects/heyex-test-images/` on Ubuntu
+2. In the RDP session → double-click the **"HEYEX Images (Ubuntu)"** shortcut on the Desktop
+   (or navigate to `\\tsclient\heyex-images\` in HEYEX 2's file browser)
+3. Select your image → HEYEX 2 reads it directly from Ubuntu — no extra copy step
+
+---
+
 ## Verified
 
 - **2026-05-10** — Full migration from Windows PC to Ubuntu 24.04 PC:
