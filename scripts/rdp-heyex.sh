@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────────────
-# rdp-heyex.sh — RDP into HEYEX 2 EC2, sharing local images folder
+# rdp-heyex.sh — RDP into HEYEX 2 EC2 with auto-password + local folder share
+#                + 4K-friendly DPI scaling
 #
-# Your local directory /home/ray/projects/heyex-test-images will appear
-# inside the Windows RDP session as:
+# Your local /home/ray/projects/heyex-test-images appears inside Windows as:
 #   \\tsclient\heyex-images\
-#
-# A shortcut "HEYEX Images (Ubuntu)" already exists on the EC2 Desktop
-# and in Documents — double-click it to open the folder inside Windows.
+# A Desktop shortcut "HEYEX Images (Ubuntu)" opens that folder.
 #
 # Usage (on your local Ubuntu PC):
 #   sudo apt install -y freerdp2-x11   # one-time install
 #   chmod +x rdp-heyex.sh
 #   ./rdp-heyex.sh
+#
+# Override display settings for non-4K monitors:
+#   HEYEX_SIZE=1920x1080 HEYEX_SCALE=100 ./rdp-heyex.sh   # 1080p
+#   HEYEX_SIZE=2560x1440 HEYEX_SCALE=140 ./rdp-heyex.sh   # 2K
+#   HEYEX_SIZE=2560x1440 HEYEX_SCALE=180 ./rdp-heyex.sh   # 4K (default)
 # ──────────────────────────────────────────────────────────────────────────────
 
 HOST="54.154.242.69"
@@ -23,6 +26,10 @@ USER="Administrator"
 KEY="$HOME/.ssh/AppWay.pem"
 LOCAL_DIR="/home/ray/projects/heyex-test-images"
 SHARE_NAME="heyex-images"
+
+# Display tuning — defaults are 4K-friendly (override via env vars)
+HEYEX_SIZE="${HEYEX_SIZE:-2560x1440}"
+HEYEX_SCALE="${HEYEX_SCALE:-180}"
 
 # ── ensure xfreerdp is installed ─────────────────────────────────────────────
 if ! command -v xfreerdp &>/dev/null; then
@@ -54,10 +61,11 @@ else
   echo ""
 fi
 
-echo "Sharing: $LOCAL_DIR"
+echo "Sharing : $LOCAL_DIR"
 echo "  → inside Windows: \\\\tsclient\\$SHARE_NAME\\"
 echo "  → or use the 'HEYEX Images (Ubuntu)' shortcut on the EC2 Desktop"
 echo ""
+echo "Display : ${HEYEX_SIZE} @ ${HEYEX_SCALE}% DPI"
 echo "Connecting to $HOST as $USER ..."
 echo ""
 
@@ -71,7 +79,10 @@ xfreerdp \
   /v:"$HOST" \
   /u:"$USER" \
   "${EXTRA_ARGS[@]}" \
-  /size:1600x900 \
+  /size:"$HEYEX_SIZE" \
+  /scale:"$HEYEX_SCALE" \
+  /scale-desktop:"$HEYEX_SCALE" \
+  /scale-device:"$HEYEX_SCALE" \
   /dynamic-resolution \
   /drive:"$SHARE_NAME","$LOCAL_DIR" \
   /clipboard \
