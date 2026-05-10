@@ -279,3 +279,5 @@ This is a one-time action per EC2 that makes the VH client automatically re-clai
 - **2026-05-10** — Auto-Use Device rule set + Elastic IP confirmed:
   - Right-clicked `USB CrypToken` in VH client → **Auto-Use Device** ✓ (check mark visible)
   - EC2 Elastic IP confirmed as `54.154.242.69` (fixed, no longer changes on stop/start)
+  - **Persistence verified**: `HELICSVC` restarted via SSM → `USB CrypToken (In use by you)` stayed
+    highlighted blue with **no manual click** — Auto-Use Device rule re-claimed dongle automatically ✓
