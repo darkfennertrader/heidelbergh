@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────────────
 # rdp-heyex.sh — RDP into HEYEX 2 EC2 with auto-password + local folder share
-#                + 4K-friendly DPI scaling
+#                + 4K-friendly display (smart-sizing stretch)
 #
 # Your local /home/ray/projects/heyex-test-images appears inside Windows as:
 #   \\tsclient\heyex-images\
@@ -12,10 +12,11 @@
 #   chmod +x rdp-heyex.sh
 #   ./rdp-heyex.sh
 #
-# Override display settings for non-4K monitors:
-#   HEYEX_SIZE=1920x1080 HEYEX_SCALE=100 ./rdp-heyex.sh   # 1080p
-#   HEYEX_SIZE=2560x1440 HEYEX_SCALE=140 ./rdp-heyex.sh   # 2K
-#   HEYEX_SIZE=2560x1440 HEYEX_SCALE=180 ./rdp-heyex.sh   # 4K (default)
+# Tuning for different monitors (override via env vars):
+#   HEYEX_SIZE=1920x1080  ./rdp-heyex.sh   # 4K monitor — 2× stretch (default)
+#   HEYEX_SIZE=1600x900   ./rdp-heyex.sh   # 4K monitor — even bigger (2.4×)
+#   HEYEX_SIZE=1280x720   ./rdp-heyex.sh   # 4K monitor — max size (3×, fuzzy)
+#   HEYEX_SIZE=1920x1080 HEYEX_SMARTSIZE=1920x1080 ./rdp-heyex.sh  # 1080p native
 # ──────────────────────────────────────────────────────────────────────────────
 
 HOST="54.154.242.69"
@@ -27,9 +28,12 @@ KEY="$HOME/.ssh/AppWay.pem"
 LOCAL_DIR="/home/ray/projects/heyex-test-images"
 SHARE_NAME="heyex-images"
 
-# Display tuning — defaults are 4K-friendly (override via env vars)
-HEYEX_SIZE="${HEYEX_SIZE:-2560x1440}"
-HEYEX_SCALE="${HEYEX_SCALE:-180}"
+# Display tuning:
+#   HEYEX_SIZE      = RDP session canvas (smaller = bigger-looking icons)
+#   HEYEX_SMARTSIZE = physical monitor resolution (smart-sizing stretches to this)
+# Defaults are tuned for a 4K (3840x2160) monitor:
+HEYEX_SIZE="${HEYEX_SIZE:-1600x900}"
+HEYEX_SMARTSIZE="${HEYEX_SMARTSIZE:-3840x2160}"
 
 # ── ensure xfreerdp is installed ─────────────────────────────────────────────
 if ! command -v xfreerdp &>/dev/null; then
@@ -65,25 +69,20 @@ echo "Sharing : $LOCAL_DIR"
 echo "  → inside Windows: \\\\tsclient\\$SHARE_NAME\\"
 echo "  → or use the 'HEYEX Images (Ubuntu)' shortcut on the EC2 Desktop"
 echo ""
-echo "Display : ${HEYEX_SIZE} @ ${HEYEX_SCALE}% DPI"
+echo "Display : session ${HEYEX_SIZE} stretched to ${HEYEX_SMARTSIZE}"
 echo "Connecting to $HOST as $USER ..."
 echo ""
 
 # ── launch RDP ───────────────────────────────────────────────────────────────
 EXTRA_ARGS=()
-if [ -n "$PASSWORD" ]; then
-  EXTRA_ARGS+=(/p:"$PASSWORD")
-fi
+[ -n "$PASSWORD" ] && EXTRA_ARGS+=(/p:"$PASSWORD")
 
 xfreerdp \
   /v:"$HOST" \
   /u:"$USER" \
   "${EXTRA_ARGS[@]}" \
   /size:"$HEYEX_SIZE" \
-  /scale:"$HEYEX_SCALE" \
-  /scale-desktop:"$HEYEX_SCALE" \
-  /scale-device:"$HEYEX_SCALE" \
-  /dynamic-resolution \
+  /smart-sizing:"$HEYEX_SMARTSIZE" \
   /drive:"$SHARE_NAME","$LOCAL_DIR" \
   /clipboard \
   /cert:ignore

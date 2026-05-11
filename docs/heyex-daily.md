@@ -90,4 +90,5 @@ Then just run `./scripts/rdp-heyex.sh` as above.
 | Local images folder | `/home/ray/projects/heyex-test-images/` |
 | Windows images folder | `\\tsclient\heyex-images\` (live, only while RDP is open) |
 
-> **Full technical docs:** `docs/heyex2-ubuntu-dongle.md`
+> **Full technical docs:** `docs/heyex2-ubuntu-dongle.md`  
+> **Hosting a Heidelberg remote-support session (BeyondTrust):** `docs/heidelberg-remote-session.md`
