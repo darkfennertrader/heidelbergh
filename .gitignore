@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.vscode
+
+# Local config & secrets
+.env
+
+# Worker scratch space (not uploaded to S3)
+outputs/
+models/
+docs/
+
+# Layout sandbox — kept on disk for reference but never committed.
+# Contains: build_page_templates.py, run.py, sample_data.py and
+# the outputs/ / sample_images/ / ai_inspect/ artefacts.
+# New canonical location: appway_backend/report/ (wired to main code).
+pdf_sandbox/
+
