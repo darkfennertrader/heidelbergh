@@ -1551,7 +1551,7 @@ def build_pdf(job: ReportJob, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     c = rl_canvas.Canvas(str(out_path), pagesize=A4)
-    c.setTitle(f"MyopicCNV+ Report — {job.job_id}")
+    c.setTitle(f"MyopicCNV+ Report - {job.job_id}")
     c.setAuthor("MyopicCNV+ backend")
     c.setCreator("appway-backend")
 

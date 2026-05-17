@@ -116,7 +116,10 @@ def _collect_input_info(dcm_files: list[Path]) -> tuple[list[dict], Optional[Dat
                 "frames": arr_shape[0] if arr_shape else 1,
                 "rows": arr_shape[1] if arr_shape else 0,
                 "columns": arr_shape[2] if arr_shape else 0,
-                "sop_instance_uid": getattr(ds, "SOPInstanceUID", ""),
+                "sop_instance_uid": str(getattr(ds, "SOPInstanceUID", "")),
+                "sop_class_uid": str(getattr(ds, "SOPClassUID", "")),
+                "series_instance_uid": str(getattr(ds, "SeriesInstanceUID", "")),
+                "study_instance_uid": str(getattr(ds, "StudyInstanceUID", "")),
             })
         except Exception as e:
             logger.warning("Could not read DICOM %s: %s", dcm_path.name, e)
@@ -383,17 +386,75 @@ def _attach_referenced_inputs(
     ds: Dataset,
     input_infos: list[dict],
 ) -> None:
-    """Attach ReferencedInstanceSequence from the per-file SOPInstanceUIDs."""
-    ref_seq = []
+    """
+    Attach DICOM reference sequences from the per-file metadata dicts.
+
+    Populates three sequences that HEYEX uses to match a result.dcm back to
+    the original study / series / instance:
+
+      (0008,1110) ReferencedStudySequence  — one item per unique StudyInstanceUID
+      (0008,1115) ReferencedSeriesSequence — one item per unique SeriesInstanceUID,
+                                             each containing its own
+                                             ReferencedInstanceSequence
+      (0008,114a) ReferencedInstanceSequence — flat list of all SOPInstanceUIDs
+                                               (kept for backward compatibility)
+    """
+    # ── Flat ReferencedInstanceSequence ──────────────────────────────────────
+    ref_inst_seq = []
     for info in input_infos:
-        uid = info.get("sop_instance_uid", "")
-        if uid:
-            ref_item = Dataset()
-            ref_item.ReferencedSOPClassUID = "1.2.840.10008.5.1.4.1.1.77.1.5.4"  # OPT
-            ref_item.ReferencedSOPInstanceUID = uid
-            ref_seq.append(ref_item)
-    if ref_seq:
-        ds.ReferencedInstanceSequence = Sequence(ref_seq)
+        sop_uid = info.get("sop_instance_uid", "")
+        sop_class = info.get("sop_class_uid", "") or "1.2.840.10008.5.1.4.1.1.77.1.5.4"
+        if sop_uid:
+            item = Dataset()
+            item.ReferencedSOPClassUID = sop_class
+            item.ReferencedSOPInstanceUID = sop_uid
+            ref_inst_seq.append(item)
+    if ref_inst_seq:
+        ds.ReferencedInstanceSequence = Sequence(ref_inst_seq)
+
+    # ── ReferencedSeriesSequence (0008,1115) — group by series UID ───────────
+    series_map: dict[str, list[dict]] = {}
+    for info in input_infos:
+        s_uid = info.get("series_instance_uid", "")
+        if s_uid:
+            series_map.setdefault(s_uid, []).append(info)
+
+    ref_series_seq = []
+    for s_uid, items in series_map.items():
+        s_item = Dataset()
+        s_item.SeriesInstanceUID = s_uid
+        inner_seq = []
+        for info in items:
+            sop_uid = info.get("sop_instance_uid", "")
+            sop_class = info.get("sop_class_uid", "") or "1.2.840.10008.5.1.4.1.1.77.1.5.4"
+            if sop_uid:
+                i = Dataset()
+                i.ReferencedSOPClassUID = sop_class
+                i.ReferencedSOPInstanceUID = sop_uid
+                inner_seq.append(i)
+        if inner_seq:
+            s_item.ReferencedInstanceSequence = Sequence(inner_seq)
+        ref_series_seq.append(s_item)
+    if ref_series_seq:
+        ds.ReferencedSeriesSequence = Sequence(ref_series_seq)
+
+    # ── ReferencedStudySequence (0008,1110) — one item per unique study ───────
+    # SOPClassUID for a Study Root Query/Retrieve – FIND SOP Class (detached study)
+    STUDY_ROOT_SOP = "1.2.840.10008.3.1.2.3.2"  # Detached Study Management SOP Class
+    study_uids: set[str] = set()
+    for info in input_infos:
+        u = info.get("study_instance_uid", "")
+        if u:
+            study_uids.add(u)
+
+    ref_study_seq = []
+    for u in study_uids:
+        st_item = Dataset()
+        st_item.ReferencedSOPClassUID = STUDY_ROOT_SOP
+        st_item.ReferencedSOPInstanceUID = u
+        ref_study_seq.append(st_item)
+    if ref_study_seq:
+        ds.ReferencedStudySequence = Sequence(ref_study_seq)
 
 
 def _copy_credential_block(ds: Dataset, donor_ds: Optional[Dataset], job_id: str) -> None:
@@ -469,10 +530,13 @@ def generate_epdf_dcm(
     logger.info("[%s] Generated PDF: %d bytes", job_id, len(pdf_bytes))
 
     # ── Build DICOM dataset ──
+    # DocumentTitle and SeriesDescription are VR LO (max 64 chars).
+    # "MyopicCNV+ Result for Job <uuid>" = 68 chars → truncate label to fit.
+    short_title = f"{SOLUTION_NAME} Result {job_id}"[:64]
     ds = _base_dicom_dataset(donor_ds, date_str, time_str)
-    ds.SeriesDescription = f"{SOLUTION_NAME} Result for Job {job_id}"
+    ds.SeriesDescription = short_title
     ds.ImageComments = f"Result from {SOLUTION_NAME}"
-    ds.DocumentTitle = f"{SOLUTION_NAME} Result for Job {job_id}"
+    ds.DocumentTitle = short_title
     ds.MIMETypeOfEncapsulatedDocument = "application/pdf"
     ds.EncapsulatedDocument = pdf_bytes
     ds.ConceptNameCodeSequence = Sequence([])
@@ -529,12 +593,14 @@ def generate_error_epdf_dcm(
     logger.info("[%s] Generated ERROR PDF: %d bytes", job_id, len(pdf_bytes))
 
     # ── Build DICOM dataset ──
+    # DocumentTitle and SeriesDescription are VR LO (max 64 chars).
+    short_err_title = f"{SOLUTION_NAME} ERROR {job_id}"[:64]
     ds = _base_dicom_dataset(donor_ds, date_str, time_str)
     # Override the ClinicalTrialSeriesDescription for the error path.
     ds.ClinicalTrialSeriesDescription = "MyopicCNV+ AI Result (ERROR)"
-    ds.SeriesDescription = f"{SOLUTION_NAME} ERROR Result for Job {job_id}"
+    ds.SeriesDescription = short_err_title
     ds.ImageComments = f"ERROR result from {SOLUTION_NAME}: {(error_message or '')[:200]}"
-    ds.DocumentTitle = f"{SOLUTION_NAME} ERROR Result for Job {job_id}"
+    ds.DocumentTitle = short_err_title
     ds.MIMETypeOfEncapsulatedDocument = "application/pdf"
     ds.EncapsulatedDocument = pdf_bytes
     ds.ConceptNameCodeSequence = Sequence([])
