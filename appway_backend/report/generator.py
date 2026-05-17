@@ -1595,14 +1595,35 @@ def build_pdf(job: ReportJob, out_path: Path) -> Path:
         c.restoreState()
         c.showPage(); page += 1
 
-    # Table pages — _draw_table_pages emits showPage() between pages but
-    # NOT after the last one; we emit it here to keep the pattern uniform.
-    c.saveState()
-    c.translate(_SIDE_M, 0)
-    c.scale(_SCALE, _SCALE)
-    _draw_table_pages(c, job, page, total)
-    c.restoreState()
-    c.showPage()
+    # Table pages — same save/restore-per-page pattern as the gallery loop.
+    #
+    # ⚠️  We do NOT call _draw_table_pages() here any more. That helper
+    # wrapped the entire set of table pages in a single saveState /
+    # restoreState, then called c.showPage() between internal chunks.
+    # showPage() flushes the graphics-state stack, so when > 10 per_image
+    # rows caused two or more table pages the restoreState() after the last
+    # showPage() would find an EMPTY stack and raise:
+    #   IndexError: pop from empty list
+    #
+    # Fix: inline the pagination here so every page gets its own
+    # saveState / [draw chrome + body] / restoreState / showPage cycle —
+    # identical to how the gallery loop handles multiple gallery pages.
+    rpp    = _table_rows_per_page()
+    all_rows = job.per_image
+    # Build chunks — at least one chunk (empty) so the table always renders.
+    tbl_chunks: list[list[PerImageResult]] = [
+        all_rows[i:i + rpp]
+        for i in range(0, max(1, len(all_rows)), rpp)
+    ] or [[]]
+    for t_chunk in tbl_chunks:
+        c.saveState()
+        c.translate(_SIDE_M, 0)
+        c.scale(_SCALE, _SCALE)
+        _draw_table_chrome(c, page, total, n_rows=len(t_chunk))
+        _draw_table_body(c, t_chunk)
+        c.restoreState()
+        c.showPage()
+        page += 1
 
     c.save()
     return out_path
