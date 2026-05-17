@@ -156,7 +156,7 @@ file_meta.MediaStorageSOPClassUID    = ref.SOPClassUID         # OPT
 file_meta.MediaStorageSOPInstanceUID = generate_uid()
 file_meta.TransferSyntaxUID          = ExplicitVRLittleEndian
 file_meta.ImplementationClassUID     = generate_uid()
-file_meta.ImplementationVersionName  = "APPWAY_TEST_BUILDER"
+file_meta.ImplementationVersionName  = "APPWAY_TEST_BLD"
 
 ds = FileDataset(str(output_dcm), {}, file_meta=file_meta, preamble=b"\x00" * 128)
 
