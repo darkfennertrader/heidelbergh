@@ -314,6 +314,12 @@ def _build_error_pdf_bytes(
 # DICOM wrapper helpers (shared between success and error paths)
 # ─────────────────────────────────────────────────────────────────────────
 
+# Heidelberg's own ePDF generator uses these file-meta values.
+# We mirror them so HEYEX doesn't reject our file on meta validation.
+HD_IMPLEMENTATION_CLASS_UID  = "1.2.276.0.30.3"
+HD_IMPLEMENTATION_VERSION    = "3.00"    # SH max 16 chars ✓
+
+
 def _base_dicom_dataset(
     donor_ds: Optional[Dataset],
     date_str: str,
@@ -321,20 +327,32 @@ def _base_dicom_dataset(
 ) -> Dataset:
     """
     Construct a Dataset with file meta, copy patient/study tags from
-    ``donor_ds``, and populate the Clinical Trial Subject Module.
-    The caller still needs to fill: SOPInstanceUID, Modality,
-    SeriesDescription, DocumentTitle, EncapsulatedDocument, etc.
+    ``donor_ds``.
+
+    Modelled on the Heidelberg gold-standard ePDF (docs/examples/
+    Example HD AppWay Result Report DICOM ePDF.dcm):
+      - ImplementationClassUID / ImplementationVersionName in file meta
+      - NO ClinicalTrial tags (gold has none)
+      - NO Manufacturer / SoftwareVersions tags (gold has none)
+      - NO ReferencedStudy/Series/InstanceSequence (gold has none)
+      - StudyDescription deduplicated (strip leading "External Patient: " prefix)
+
+    The caller still needs to fill: SeriesDescription, DocumentTitle,
+    EncapsulatedDocument, ConceptNameCodeSequence, etc.
     """
     ds = Dataset()
 
+    # ── File meta — mirror Heidelberg's implementation identifiers ────────
     file_meta = FileMetaDataset()
-    file_meta.MediaStorageSOPClassUID = ENCAPSULATED_PDF_SOPCLASS
+    file_meta.MediaStorageSOPClassUID    = ENCAPSULATED_PDF_SOPCLASS
     file_meta.MediaStorageSOPInstanceUID = generate_uid()
-    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    file_meta.TransferSyntaxUID          = ExplicitVRLittleEndian
+    file_meta.ImplementationClassUID     = HD_IMPLEMENTATION_CLASS_UID
+    file_meta.ImplementationVersionName  = HD_IMPLEMENTATION_VERSION
     ds.file_meta = file_meta
     ds.preamble = b"\x00" * 128
 
-    # ── Copy patient / study tags from donor ──
+    # ── Copy patient / study tags from donor ──────────────────────────────
     if donor_ds is not None:
         for kw in ["PatientName", "PatientID", "PatientBirthDate", "PatientSex",
                    "StudyInstanceUID", "StudyDate", "StudyTime", "StudyID",
@@ -343,39 +361,38 @@ def _base_dicom_dataset(
             if hasattr(donor_ds, kw):
                 setattr(ds, kw, getattr(donor_ds, kw))
 
-    # ── Clinical Trial Subject Module (DICOM PS3.3, Table C.7-2b) ─────────
-    # Mandatory per Heidelberg AppWay Interface Description V4 §9.2 for
-    # non-clinical AI solutions (B6 in docs/next-steps.md).
-    ds.ClinicalTrialSponsorName  = SOLUTION_NAME
-    ds.ClinicalTrialProtocolID   = f"MYOPICCNV-APPWAY-{config.CLINICAL_TRIAL_PROTOCOL_VERSION}"
-    ds.ClinicalTrialProtocolName = "MyopicCNV+ Non-Clinical AI Analysis"
-    ds.ClinicalTrialSubjectID    = str(getattr(donor_ds, "PatientID", "") or "UNKNOWN") if donor_ds else "UNKNOWN"
-    # ── Clinical Trial Series Module (DICOM PS3.3, Table C.7-5b) ─────────
-    ds.ClinicalTrialSeriesDescription = "MyopicCNV+ AI Result"
+    # ── De-duplicate StudyDescription ────────────────────────────────────
+    # HEYEX sometimes prefixes "External Patient: " when building the
+    # test DICOM, which can propagate as a double-prefix on re-use.
+    # Normalise to at most one occurrence.
+    if hasattr(ds, "StudyDescription"):
+        sd = str(ds.StudyDescription or "")
+        prefix = "External Patient: "
+        while sd.startswith(prefix + prefix):
+            sd = sd[len(prefix):]
+        ds.StudyDescription = sd
 
-    # ── SOP Common ──
-    ds.SOPClassUID = ENCAPSULATED_PDF_SOPCLASS
-    ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    # ── SOP Common ────────────────────────────────────────────────────────
+    ds.SOPClassUID      = ENCAPSULATED_PDF_SOPCLASS
+    ds.SOPInstanceUID   = file_meta.MediaStorageSOPInstanceUID
     ds.SpecificCharacterSet = "ISO_IR 192"
 
-    # ── General Series ──
-    ds.Modality = "DOC"
-    ds.SeriesInstanceUID = generate_uid()
-    ds.SeriesNumber = "1000"
-    ds.SeriesDate = date_str
-    ds.SeriesTime = time_str
-    ds.ConversionType = "WSD"
+    # ── General Series ────────────────────────────────────────────────────
+    ds.Modality           = "DOC"
+    ds.SeriesInstanceUID  = generate_uid()
+    ds.SeriesNumber       = "1000"
+    ds.SeriesDate         = date_str
+    ds.SeriesTime         = time_str
+    ds.ConversionType     = "WSD"
 
-    # ── General Image / Document ──
-    ds.InstanceNumber = "1"
-    ds.ContentDate = date_str
-    ds.ContentTime = time_str
-    ds.AcquisitionDate = date_str
-    ds.AcquisitionTime = time_str
+    # ── General Image / Document ──────────────────────────────────────────
+    ds.InstanceNumber     = "1"
+    ds.ContentDate        = date_str
+    ds.ContentTime        = time_str
+    ds.AcquisitionDate    = date_str
+    ds.AcquisitionTime    = time_str
     ds.AcquisitionDateTime = date_str + time_str
     ds.BurnedInAnnotation = "YES"
-    ds.Manufacturer = SOLUTION_NAME
-    ds.SoftwareVersions = SOLUTION_VERSION
     ds.FrameOfReferenceUID = generate_uid()
     ds.StudyID = getattr(donor_ds, "StudyID", "no id") if donor_ds else "no id"
 
@@ -387,74 +404,18 @@ def _attach_referenced_inputs(
     input_infos: list[dict],
 ) -> None:
     """
-    Attach DICOM reference sequences from the per-file metadata dicts.
+    NOTE (gold-standard comparison 2026-05-17):
+    The Heidelberg gold-standard ePDF does NOT include
+    ReferencedStudySequence, ReferencedSeriesSequence, or
+    ReferencedInstanceSequence. Adding them caused HEYEX to hang
+    indefinitely on "result pending". This function is intentionally
+    a no-op — kept as a named function for future reference.
 
-    Populates three sequences that HEYEX uses to match a result.dcm back to
-    the original study / series / instance:
-
-      (0008,1110) ReferencedStudySequence  — one item per unique StudyInstanceUID
-      (0008,1115) ReferencedSeriesSequence — one item per unique SeriesInstanceUID,
-                                             each containing its own
-                                             ReferencedInstanceSequence
-      (0008,114a) ReferencedInstanceSequence — flat list of all SOPInstanceUIDs
-                                               (kept for backward compatibility)
+    HEYEX routes the result back via the credential block (0x0011),
+    NOT via DICOM reference sequences.
     """
-    # ── Flat ReferencedInstanceSequence ──────────────────────────────────────
-    ref_inst_seq = []
-    for info in input_infos:
-        sop_uid = info.get("sop_instance_uid", "")
-        sop_class = info.get("sop_class_uid", "") or "1.2.840.10008.5.1.4.1.1.77.1.5.4"
-        if sop_uid:
-            item = Dataset()
-            item.ReferencedSOPClassUID = sop_class
-            item.ReferencedSOPInstanceUID = sop_uid
-            ref_inst_seq.append(item)
-    if ref_inst_seq:
-        ds.ReferencedInstanceSequence = Sequence(ref_inst_seq)
-
-    # ── ReferencedSeriesSequence (0008,1115) — group by series UID ───────────
-    series_map: dict[str, list[dict]] = {}
-    for info in input_infos:
-        s_uid = info.get("series_instance_uid", "")
-        if s_uid:
-            series_map.setdefault(s_uid, []).append(info)
-
-    ref_series_seq = []
-    for s_uid, items in series_map.items():
-        s_item = Dataset()
-        s_item.SeriesInstanceUID = s_uid
-        inner_seq = []
-        for info in items:
-            sop_uid = info.get("sop_instance_uid", "")
-            sop_class = info.get("sop_class_uid", "") or "1.2.840.10008.5.1.4.1.1.77.1.5.4"
-            if sop_uid:
-                i = Dataset()
-                i.ReferencedSOPClassUID = sop_class
-                i.ReferencedSOPInstanceUID = sop_uid
-                inner_seq.append(i)
-        if inner_seq:
-            s_item.ReferencedInstanceSequence = Sequence(inner_seq)
-        ref_series_seq.append(s_item)
-    if ref_series_seq:
-        ds.ReferencedSeriesSequence = Sequence(ref_series_seq)
-
-    # ── ReferencedStudySequence (0008,1110) — one item per unique study ───────
-    # SOPClassUID for a Study Root Query/Retrieve – FIND SOP Class (detached study)
-    STUDY_ROOT_SOP = "1.2.840.10008.3.1.2.3.2"  # Detached Study Management SOP Class
-    study_uids: set[str] = set()
-    for info in input_infos:
-        u = info.get("study_instance_uid", "")
-        if u:
-            study_uids.add(u)
-
-    ref_study_seq = []
-    for u in study_uids:
-        st_item = Dataset()
-        st_item.ReferencedSOPClassUID = STUDY_ROOT_SOP
-        st_item.ReferencedSOPInstanceUID = u
-        ref_study_seq.append(st_item)
-    if ref_study_seq:
-        ds.ReferencedStudySequence = Sequence(ref_study_seq)
+    # Do NOT populate any reference sequences — gold standard has none.
+    pass
 
 
 def _copy_credential_block(ds: Dataset, donor_ds: Optional[Dataset], job_id: str) -> None:
@@ -596,8 +557,6 @@ def generate_error_epdf_dcm(
     # DocumentTitle and SeriesDescription are VR LO (max 64 chars).
     short_err_title = f"{SOLUTION_NAME} ERROR {job_id}"[:64]
     ds = _base_dicom_dataset(donor_ds, date_str, time_str)
-    # Override the ClinicalTrialSeriesDescription for the error path.
-    ds.ClinicalTrialSeriesDescription = "MyopicCNV+ AI Result (ERROR)"
     ds.SeriesDescription = short_err_title
     ds.ImageComments = f"ERROR result from {SOLUTION_NAME}: {(error_message or '')[:200]}"
     ds.DocumentTitle = short_err_title
