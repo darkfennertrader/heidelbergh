@@ -285,7 +285,12 @@ def _parse_worker_log_lines(raw: str, job_id: str) -> list[tuple[datetime, str]]
 
 _HEYEX_LOG_DIR  = r"C:\HEYEX\logfiles"
 _APPWAY_LOG_DIR = r"C:\HEYEX\AshvinsDistribution"
+_UVOB_DIR       = r"C:\HEYEX\ImagwPool\UVOBackup"
 _HEYEX_TS_RE    = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)")
+# Folder name timestamp embedded in AIResultBackup entries:
+# e.g. K1b9b9cf6-ac92_Gcda68a17_2026.05.18-11.11.24.589-AIResultBackup-<uuid>
+# The timestamp comes BEFORE "AIResultBackup" in the name.
+_AIBACKUP_TS_RE = re.compile(r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})\.\d+-AIResultBackup")
 
 
 def _parse_heyex_ts(ts_str: str) -> Optional[datetime]:
@@ -297,63 +302,115 @@ def _parse_heyex_ts(ts_str: str) -> Optional[datetime]:
     return None
 
 
+def _parse_folder_ts(ts_str: str) -> Optional[datetime]:
+    """Parse YYYY.MM.DD-HH.MM.SS folder timestamp (CEST) → UTC-aware datetime."""
+    try:
+        return datetime.strptime(ts_str, "%Y.%m.%d-%H.%M.%S").replace(tzinfo=CEST).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
+    r"""
+    Query heyex2 via SSM for stage markers.
+
+    Stage sources (confirmed):
+      [1]  AshvinsDistribution\ -- newest .zip file with ts >= job_origin_ts
+           (AppWay Link exports the DICOM as a zip before S3 upload)
+      [8]  AshvinsDistribution\ -- newest .rtc.dcm file with ts >= job_origin_ts
+           (AppWay Link stores result after downloading from S3)
+      [9]  ImagwPool\UVOBackup\ -- newest AIResultBackup-* folder with ts >= job_origin_ts
+           (HEYEX writes a backup marker when it stores the AI result)
+      [X]  MCAshvinsWorkstation.verbose.log -- "couldn't open file" with ts >= job_origin_ts
+    """
     found: dict = {}
 
-    ps_heyex = (
-        r'$log = "' + _HEYEX_LOG_DIR + r'\MCAshvinsWorkstation.verbose.log"; '
-        r'if (Test-Path $log) { '
-        r'  Get-Content $log | Select-String -Pattern "couldn''t open file|ImagwPool" | Select-Object -Last 40 '
-        r'} else { "LOG_NOT_FOUND" }'
-    )
-    heyex_out = ssm_run(HEYEX2_INSTANCE, ps_heyex)
-
-    for line in heyex_out.splitlines():
-        ts_m  = _HEYEX_TS_RE.search(line)
-        ts    = _parse_heyex_ts(ts_m.group(1)) if ts_m else None
-        path_m = re.search(r'(\\\\[^\s\t<>]+\.dcm|C:\\[^\s\t<>]+\.dcm)', line, re.IGNORECASE)
-
-        if "couldn't open file" in line.lower() or "could not read the dicom" in line.lower():
-            bad_path = path_m.group(1) if path_m else "(unknown path)"
-            if "click_error" not in found and ts is not None:
-                # Only record click errors that happened AFTER the job's DICOM was uploaded
-                # (strict >=). This prevents stale errors from earlier jobs appearing.
-                if job_origin_ts is None or ts >= job_origin_ts:
-                    found["click_error"] = (ts, bad_path, line.strip()[:200])
-        elif "ImagwPool" in line and ts is not None and "result_stored" not in found:
-            # Only accept a result_stored entry that happened AFTER the job was uploaded
-            if job_origin_ts is None or ts >= job_origin_ts:
-                found["result_stored"] = (ts, path_m.group(1) if path_m else "?", None)
-
+    # ── [1] and [8] from AshvinsDistribution ─────────────────────────────────
     ps_appway = (
         r'$dir = "' + _APPWAY_LOG_DIR + r'"; '
         r'if (Test-Path $dir) { '
         r'  Get-ChildItem $dir -ErrorAction SilentlyContinue | '
-        r'  Sort-Object LastWriteTime -Descending | Select-Object -First 10 | '
+        r'  Sort-Object LastWriteTime -Descending | Select-Object -First 20 | '
         r'  Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize '
         r'} else { "DIR_NOT_FOUND" }'
     )
     appway_out = ssm_run(HEYEX2_INSTANCE, ps_appway)
 
     for line in appway_out.splitlines():
-        if ".zip" in line.lower() and "result_downloaded" not in found:
+        line = line.strip()
+        if not line:
+            continue
+        ts_m = re.search(r'(\d+/\d+/\d{4}\s+\d+:\d+:\d+\s+[AP]M)', line)
+        if not ts_m:
+            continue
+        try:
+            ts = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=CEST).astimezone(timezone.utc)
+        except ValueError:
+            continue
+        if job_origin_ts is not None and ts < job_origin_ts:
+            continue   # skip entries older than this job
+
+        if ".zip" in line.lower() and "appway_rcvd" not in found:
+            found["appway_rcvd"] = (ts, line.split()[0])   # stage [1]: AppWay received input
+
+        if ".rtc.dcm" in line.lower() and "result_downloaded" not in found:
+            found["result_downloaded"] = (ts, line.split()[0])   # stage [8]: result back to AppWay
+
+    # ── [9] from UVOBackup AIResultBackup folders ─────────────────────────────
+    ps_uvo = (
+        r'$dir = "' + _UVOB_DIR + r'"; '
+        r'if (Test-Path $dir) { '
+        r'  Get-ChildItem $dir -ErrorAction SilentlyContinue | '
+        r'  Where-Object { $_.Name -like "*AIResultBackup*" } | '
+        r'  Sort-Object LastWriteTime -Descending | Select-Object -First 10 | '
+        r'  Select-Object Name, LastWriteTime | Format-Table -AutoSize -Wrap '
+        r'} else { "DIR_NOT_FOUND" }'
+    )
+    uvo_out = ssm_run(HEYEX2_INSTANCE, ps_uvo)
+
+    for line in uvo_out.splitlines():
+        line = line.strip()
+        if "AIResultBackup" not in line:
+            continue
+        # Try to parse timestamp from folder name first (most accurate)
+        fn_m = _AIBACKUP_TS_RE.search(line)
+        ts = _parse_folder_ts(fn_m.group(1)) if fn_m else None
+        # Fall back to Format-Table LastWriteTime field
+        if ts is None:
             ts_m = re.search(r'(\d+/\d+/\d{4}\s+\d+:\d+:\d+\s+[AP]M)', line)
             if ts_m:
                 try:
                     ts = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=CEST).astimezone(timezone.utc)
-                    found["result_downloaded"] = (ts, line.strip())
                 except ValueError:
                     pass
-        if ".rtc.dcm" in line.lower() and "result_stored" not in found:
-            ts_m = re.search(r'(\d+/\d+/\d{4}\s+\d+:\d+:\d+\s+[AP]M)', line)
-            if ts_m:
-                try:
-                    ts = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=CEST).astimezone(timezone.utc)
-                    # Only accept if this .rtc.dcm was created after the job's DICOM upload
-                    if job_origin_ts is None or ts >= job_origin_ts:
-                        found["result_stored"] = (ts, f"AshvinsDistribution/{line.split()[0]}", None)
-                except ValueError:
-                    pass
+        if ts is None:
+            continue
+        if job_origin_ts is not None and ts < job_origin_ts:
+            continue
+        if "result_stored" not in found:
+            # Extract just the AIResultBackup UUID part for the detail label
+            uuid_m = re.search(r"AIResultBackup-([0-9a-f-]{36})", line)
+            label = f"UVOBackup/…AIResultBackup-{uuid_m.group(1)}" if uuid_m else line[:80]
+            found["result_stored"] = (ts, label, None)
+
+    # ── [X] click errors from MCAshvinsWorkstation.verbose.log ────────────────
+    ps_heyex = (
+        r'$log = "' + _HEYEX_LOG_DIR + r'\MCAshvinsWorkstation.verbose.log"; '
+        r'if (Test-Path $log) { '
+        r'  Get-Content $log | Select-String -Pattern "couldn''t open file" | Select-Object -Last 20 '
+        r'} else { "LOG_NOT_FOUND" }'
+    )
+    heyex_out = ssm_run(HEYEX2_INSTANCE, ps_heyex)
+
+    for line in heyex_out.splitlines():
+        ts_m   = _HEYEX_TS_RE.search(line)
+        ts     = _parse_heyex_ts(ts_m.group(1)) if ts_m else None
+        path_m = re.search(r'(\\\\[^\s\t<>]+\.dcm|C:\\[^\s\t<>]+\.dcm)', line, re.IGNORECASE)
+        if "couldn't open file" in line.lower():
+            bad_path = path_m.group(1) if path_m else "(unknown path)"
+            if "click_error" not in found and ts is not None:
+                if job_origin_ts is None or ts >= job_origin_ts:
+                    found["click_error"] = (ts, bad_path, line.strip()[:200])
 
     return found
 
@@ -472,25 +529,31 @@ def build_timeline(job_id: str) -> list[Stage]:
     job_origin_ts = s3_incoming[0]["last_modified"] if s3_incoming else None
     heyex_data    = _heyex_grep(job_id, job_origin_ts=job_origin_ts)
 
-    if "dicom_received" in heyex_data:
-        ts, path, size = heyex_data["dicom_received"]
-        stages.append(Stage("1", "DICOM received by AppWay Link", ts,
-                            f"{path}  ({_fmt_size(size) if size else '?'})"))
+    # [1] AppWay received DICOM (.zip in AshvinsDistribution)
+    if "appway_rcvd" in heyex_data:
+        ts, filename = heyex_data["appway_rcvd"]
+        stages.append(Stage("1", "DICOM received by AppWay Link",  ts,
+                            f"AshvinsDistribution/{filename}"))
     else:
-        stages.append(Stage("1", "DICOM received by AppWay Link", None, "(not found in AppWay Link logs)"))
+        stages.append(Stage("1", "DICOM received by AppWay Link", None,
+                            "(no .zip found in AshvinsDistribution)"))
 
+    # [8] AppWay stored result (.rtc.dcm in AshvinsDistribution)
     if "result_downloaded" in heyex_data:
-        ts, raw = heyex_data["result_downloaded"]
-        stages.append(Stage("8", "Result downloaded by AppWay Link", ts, raw[:120]))
+        ts, filename = heyex_data["result_downloaded"]
+        stages.append(Stage("8", "Result stored by AppWay Link", ts,
+                            f"AshvinsDistribution/{filename}"))
     else:
-        stages.append(Stage("8", "Result downloaded by AppWay Link", None, "(not found in AppWay Link logs)"))
+        stages.append(Stage("8", "Result stored by AppWay Link", None,
+                            "(no .rtc.dcm found in AshvinsDistribution)"))
 
+    # [9] HEYEX stored AI result (AIResultBackup folder in UVOBackup)
     if "result_stored" in heyex_data:
-        ts, path, size = heyex_data["result_stored"]
-        stages.append(Stage("9", "Result stored in HEYEX", ts,
-                            f"{path}  ({_fmt_size(size) if size else '?'})"))
+        ts, label, _ = heyex_data["result_stored"]
+        stages.append(Stage("9", "Result stored in HEYEX", ts, label))
     else:
-        stages.append(Stage("9", "Result stored in HEYEX", None, "(not found in MCAshvinsWorkstation log)"))
+        stages.append(Stage("9", "Result stored in HEYEX", None,
+                            "(no AIResultBackup entry found in UVOBackup)"))
 
     if "click_error" in heyex_data:
         ts, bad_path, msg = heyex_data["click_error"]
@@ -613,8 +676,8 @@ def main():
                             help="Stream new events as they appear; exit on stage [9] or idle timeout")
     parser.add_argument("--interval", type=int, default=5, metavar="SEC",
                         help="Poll interval for --live mode (default: 5 s)")
-    parser.add_argument("--idle-timeout", type=int, default=600, metavar="SEC",
-                        help="Seconds of no new events after stage [6] before auto-exit (default: 600)")
+    parser.add_argument("--idle-timeout", type=int, default=300, metavar="SEC",
+                        help="Seconds of no new events after stage [6] before auto-exit (default: 300)")
     parser.add_argument("--utc-only", action="store_true",
                         help="Show UTC timestamps only (default: CEST primary + UTC secondary)")
     parser.add_argument("--no-heyex", action="store_true",
