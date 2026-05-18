@@ -289,6 +289,89 @@ format as `docs/appway.md`.
 
 ---
 
+## Troubleshooting
+
+### ① WebView2 "can't reach this page" when clicking a result tile
+
+**Symptom:** After a successful AppWay job the result tile appears in HEYEX, but clicking
+it shows the WebView2 error *"Hmm, can't reach this page"*. The log
+`C:\HEYEX\LogFiles\MCAshvinsWorkstation.verbose.log` contains:
+
+```
+MiiiDcmFile constructor error, couldn't open file
+  \\ec2amaz-uim0t5t\ImagwPool\MC1\3\11\<N>\<timestamp>.<rand>.dcm
+  for reading
+  error, message was: The system cannot find the path specified
+  at MC.StudyManager.Documents.MCFDocumentsPanel.ThreadLoadDICOMReport
+```
+
+**Root cause:** HEYEX holds an in-memory path record (cached by `MCAshvinsWorkstation`)
+that points to a slot (`\<N>\`) that no longer exists — either the input DICOM was moved
+to `UVOBackup\…\DeleteImage-Done\` or the path was stale from before the AppWay Link
+wrote the result into a different slot. The SQL Anywhere DB (`dbsrv17`) and the
+workstation process get out of sync after long uptime sessions.
+
+**The result file itself is fine** — it was written correctly to disk by AppWay Link.
+Only the pointer HEYEX uses to open it on click is wrong.
+
+**Fix — try in order (fastest → most disruptive):**
+
+1. **Restart just `MCAshvinsWorkstation.exe`** (closes the HEYEX GUI and reopens it —
+   ~30 s, no service interruption):
+
+   ```bash
+   # From the backend EC2 via SSM:
+   python3 scripts/ssm_run.py --instance heyex2 - << 'EOF'
+   Stop-Process -Name "MCAshvinsWorkstation" -Force -ErrorAction SilentlyContinue
+   Start-Sleep -Seconds 3
+   Start-Process "C:\HEYEX\MCAshvinsWorkstation.exe"
+   EOF
+   ```
+
+   After the GUI restarts, wait ~10 s and click the result tile again.
+   This clears the in-memory path cache; the tile should open correctly.
+
+2. **Restart the core HEYEX services** (if step 1 doesn't help — flushes the DB
+   connection pool as well, ~2 min):
+
+   ```bash
+   python3 scripts/ssm_run.py --instance heyex2 - << 'EOF'
+   # Stop
+   Stop-Process -Name "MCAshvinsWorkstation","MCAshvinsViewer" -Force -ErrorAction SilentlyContinue
+   Stop-Service -Name "MCUVOService","MCImportNTService","MCDicomNTService" -Force -ErrorAction SilentlyContinue
+   Start-Sleep -Seconds 5
+
+   # Restart SQL Anywhere (clears the DB path cache)
+   Restart-Service -Name "SQLANYs_EOL_HEYEX" -Force
+
+   Start-Sleep -Seconds 10
+
+   # Restart HEYEX services
+   Start-Service -Name "MCDicomNTService","MCImportNTService","MCUVOService"
+   Start-Process "C:\HEYEX\MCAshvinsWorkstation.exe"
+   EOF
+   ```
+
+3. **Full EC2 reboot** (guaranteed fix, ~3 min):
+
+   ```bash
+   aws ec2 reboot-instances --instance-ids i-02a7dd1797d85a099
+   # Wait ~3 min, then verify SSM is back:
+   aws ssm describe-instance-information \
+     --filters "Key=InstanceIds,Values=i-02a7dd1797d85a099" \
+     --query 'InstanceInformationList[0].PingStatus' --output text
+   ```
+
+**Confirmed occurrence:** 2026-05-17/18 — job `final-5f1e35fa-3397-4604-b5c1-a7785919ea13`.
+Result (`\MC1\3\11\30\…q11rqjd2.gfp.dcm`, 325 KB) was stored correctly on disk.
+After reboot the tile opened without error. ✓
+
+> **Note to Heidelberg:** We asked Rouven (2026-05-18) whether there is an official
+> cache-flush API or HEYEX CLI command shorter than a full service restart. Will update
+> this section once we hear back.
+
+---
+
 ## Verified
 
 - **2026-04-30 13:24 UTC** — IAM role `EC2Heyex2TestingRole` attached to instance
