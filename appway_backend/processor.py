@@ -12,6 +12,27 @@ DICOM processor. Per-job local layout:
         result.pdf                 single combined report (also embedded in result.dcm)
 
     ~/appway-workdir/<job-id>/output/result.dcm   ← only uploaded to S3 (1 per job)
+
+Display-name mapping
+--------------------
+The on-disk PNG filename is derived from the DICOM stem (e.g.
+``20260518134605164_24ab7967d8494e23ba3777ed750edd4f.png``), which is what
+``inference.run_inference()`` returns in ``per_image[i]["filename"]``.
+
+For test DICOMs built by ``scripts/build_test_dcm.sh`` the *original* image
+filename (e.g. ``bertipagliap012.jpeg``) is preserved in the DICOM's
+``ImageComments`` tag.  We read that tag here and build a
+``display_name_map``:
+
+    on-disk PNG stem → original display name (with original extension)
+
+After inference we patch ``inference_result["per_image"][i]["filename"]``
+with the display name so the ePDF "Per-Image Results" table always shows
+what the clinician uploaded, not the internal pipeline artefact name.
+
+For multi-frame volumes the display names come from ``_derive_frame_labels()``
+(which already consults ``ImageComments`` — see its docstring), so those PNGs
+already carry meaningful names on disk and no additional patching is needed.
 """
 
 import json
@@ -264,6 +285,57 @@ def _dicom_to_png(ds: pydicom.Dataset, dest: Path) -> None:
         raise ValueError(f"Unexpected pixel array shape: {arr.shape}")
 
 
+def _build_display_name_map(
+    ds: pydicom.Dataset,
+    stem: str,
+    n_frames: int,
+) -> dict[str, str]:
+    """
+    Build a mapping  on-disk-PNG-stem → display-name-with-original-extension
+    for one DICOM file.
+
+    For test DICOMs the original filenames live in ``ImageComments`` as a
+    comma-separated list (written by ``build_test_dcm.sh``).
+
+    Example (single-frame):
+        ImageComments = "bertipagliap012.jpeg"
+        stem          = "20260518134605164_24ab7967d8494e23ba3777ed750edd4f"
+        n_frames      = 1
+        → {"20260518134605164_24ab7967d8494e23ba3777ed750edd4f": "bertipagliap012.jpeg"}
+
+    Example (multi-frame, 2 images):
+        ImageComments = "bertipagliap012.jpeg, bertipagliap013.jpeg"
+        _derive_frame_labels() returns ["bertipagliap012", "bertipagliap013"]
+        → {"bertipagliap012": "bertipagliap012.jpeg",
+           "bertipagliap013": "bertipagliap013.jpeg"}
+
+    For real Heidelberg DICOMs (no ImageComments with filenames) the dict is
+    empty and the on-disk PNG name is used verbatim in the report.
+    """
+    mapping: dict[str, str] = {}
+    try:
+        ic = str(getattr(ds, "ImageComments", "") or "").strip()
+        if not ic:
+            return mapping
+        names = [n.strip() for n in ic.split(",") if n.strip()]
+        if len(names) != n_frames or not all("." in n for n in names):
+            return mapping
+
+        if n_frames == 1:
+            # Single-frame: on-disk PNG stem is the DICOM stem.
+            # Display name is the original filename (e.g. bertipagliap012.jpeg).
+            mapping[stem] = names[0]
+        else:
+            # Multi-frame: on-disk PNG stems are derived by _derive_frame_labels(),
+            # which strips the extension.  Reconstruct from the ImageComments list.
+            for orig_name in names:
+                png_stem = _sanitize_for_filename(Path(orig_name).stem)
+                mapping[png_stem] = orig_name
+    except Exception:
+        pass
+    return mapping
+
+
 def process(job_id: str, input_dir: Path, output_dir: Path) -> None:
     """
     For every .dcm file in input_dir:
@@ -281,6 +353,11 @@ def process(job_id: str, input_dir: Path, output_dir: Path) -> None:
     # Collect the per-DICOM PNG subdirectories so the ePDF generator can
     # locate each positive image later for the Appendix (red bbox overlay).
     png_dirs: list[Path] = []
+
+    # Map from on-disk PNG stem → original display name with original extension.
+    # Populated below, used to patch inference_result filenames before ePDF
+    # generation.  See module docstring for the full explanation.
+    display_name_map: dict[str, str] = {}
 
     files = sorted(input_dir.rglob("*"))
     for src in files:
@@ -318,24 +395,29 @@ def process(job_id: str, input_dir: Path, output_dir: Path) -> None:
             logger.error("[%s]   Metadata extraction failed for %s: %s", job_id, src.name, e)
 
         # --- Pixel data → PNG ---
-        # Use the DICOM stem as the PNG filename so the report's
-        # "Per-Image Results" table shows the original input filename
-        # (e.g. "20260518132053.rfzyz2kj.oer.png") rather than a
-        # generic "image.png".  For multi-frame volumes _dicom_to_png()
-        # overrides the dest stem anyway (using ImageComments CSV labels
-        # or per-frame B-scan metadata), so this only matters for
-        # single-frame DICOMs.
+        # Use the DICOM stem as the PNG filename so each artefact is unique.
+        # For multi-frame volumes _dicom_to_png() overrides the dest stem
+        # using ImageComments CSV labels or per-frame B-scan metadata.
         try:
             png_path = dicom_dir / f"{stem}.png"
             _dicom_to_png(ds, png_path)
             logger.info("[%s]   PNG saved → %s", job_id, png_path)
         except Exception as e:
             logger.error("[%s]   PNG extraction failed for %s: %s", job_id, src.name, e)
+            continue
+
+        # --- Build display-name map for this DICOM ---
+        # Determine frame count: use NumberOfFrames if present, else 1.
+        try:
+            n_frames_tag = getattr(ds, "NumberOfFrames", None)
+            n_frames = int(n_frames_tag) if n_frames_tag else 1
+        except Exception:
+            n_frames = 1
+        display_name_map.update(_build_display_name_map(ds, stem, n_frames))
 
     # --- Run YOLO inference on extracted PNG images ---
     # rglob so we pick up PNGs in every per-DICOM subdirectory.
     png_paths = sorted(job_outputs_dir.rglob("*.png"))
-
 
     logger.info("[%s] Running inference on %d PNG(s)…", job_id, len(png_paths))
     inference_result = None
@@ -350,6 +432,22 @@ def process(job_id: str, input_dir: Path, output_dir: Path) -> None:
         )
     except Exception as e:
         logger.error("[%s] Inference failed: %s — falling back to report without AI result", job_id, e)
+
+    # --- Patch inference filenames with display names ---
+    # inference.run_inference() sets filename = on-disk PNG name (e.g.
+    # "20260518134605164_24ab7967d8494e23ba3777ed750edd4f.png").
+    # Replace each with the original display name where available so the
+    # ePDF "Per-Image Results" table shows "bertipagliap012.jpeg" etc.
+    if inference_result and display_name_map:
+        for item in inference_result.get("per_image") or []:
+            png_stem = Path(item.get("filename") or "").stem
+            if png_stem in display_name_map:
+                old_name = item["filename"]
+                item["filename"] = display_name_map[png_stem]
+                logger.info(
+                    "[%s]   Display-name patch: %s → %s",
+                    job_id, old_name, item["filename"],
+                )
 
     # --- Generate ePDF result DICOM ---
     logger.info("[%s] Generating ePDF result DICOM…", job_id)
