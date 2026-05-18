@@ -21,10 +21,16 @@ Stages covered
 
 Usage
 ─────
-  # One-shot (single query, print & append to logs/workflow.logs):
+  # Auto-detect newest job and watch live (recommended after dragging DCM into HEYEX):
+  python scripts/job_timeline.py --live
+
+  # Auto-detect, one-shot (picks the newest existing job in S3 incoming/):
+  python scripts/job_timeline.py
+
+  # Explicit job id, one-shot:
   python scripts/job_timeline.py <job-id>
 
-  # Live mode (re-query every 5 s, redraw until stage ⑨ seen or Ctrl-C):
+  # Explicit job id, live mode (re-query every 5 s, redraw until stage ⑨ seen or Ctrl-C):
   python scripts/job_timeline.py <job-id> --live
 
   # UTC-only timestamps (default: CEST primary + UTC secondary):
@@ -133,6 +139,35 @@ def _s3():
 
 def _ssm():
     return boto3.client("ssm", region_name=AWS_REGION)
+
+
+def discover_job_id(since: Optional[datetime] = None) -> Optional[tuple[str, datetime]]:
+    """
+    Find the most recent job_id in S3 incoming/.
+
+    If *since* is given (UTC-aware datetime), only jobs whose newest S3 object
+    was uploaded **after** that moment are considered.  This lets --live mode
+    wait for a brand-new job to appear.
+
+    Returns (job_id, last_modified_utc) or None when no qualifying job exists.
+    """
+    objs = s3_list_prefix("incoming/")
+    # key format: incoming/<job_id>/<filename>
+    by_job: dict[str, datetime] = {}
+    for o in objs:
+        parts = o["key"].split("/", 2)
+        if len(parts) < 3:
+            continue
+        jid = parts[1]
+        ts  = o["last_modified"]
+        if since is not None and ts <= since:
+            continue
+        if jid not in by_job or ts > by_job[jid]:
+            by_job[jid] = ts
+    if not by_job:
+        return None
+    jid, ts = max(by_job.items(), key=lambda kv: kv[1])
+    return jid, ts
 
 
 def s3_list_prefix(prefix: str) -> list[dict]:
@@ -657,7 +692,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("job_id", help="Job ID, e.g. final-5f1e35fa-3397-4604-b5c1-a7785919ea13")
+    parser.add_argument("job_id", nargs="?", default=None,
+                        help="Job ID (e.g. final-…). If omitted, auto-detected from S3 incoming/.")
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--one-shot", action="store_true", default=True,
                             help="Query once, print, append to logs/workflow.logs, exit (default)")
@@ -675,12 +711,23 @@ def main():
     if args.live:
         args.one_shot = False
 
-    job_id = args.job_id.strip()
+    # ── resolve job_id ───────────────────────────────────────────────────────
+    job_id = args.job_id.strip() if args.job_id else None
 
-    def _run_once() -> tuple[str, bool]:
+    if job_id is None and not args.live:
+        # One-shot auto-detect: pick the newest job already in S3
+        result = discover_job_id()
+        if result is None:
+            print("  ✗ No jobs found in s3://appway-bridge-prod/incoming/ — nothing to show.", file=sys.stderr)
+            sys.exit(1)
+        job_id, ts = result
+        print(f"  Auto-detected job: {job_id}  (uploaded {_fmt_ts(ts)})")
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _run_once(jid: str) -> tuple[str, bool]:
         """Query, render, return (rendered_text, stage9_seen)."""
-        stages = build_timeline(job_id)
-        text = render_timeline(job_id, stages, utc_only=args.utc_only)
+        stages = build_timeline(jid)
+        text = render_timeline(jid, stages, utc_only=args.utc_only)
         stage9_seen = any(
             st.number == "⑨" and st.ts is not None for st in stages
         )
@@ -688,31 +735,77 @@ def main():
 
     if not args.live:
         # ── one-shot ─────────────────────────────────────────────────────────
-        text, _ = _run_once()
+        text, _ = _run_once(job_id)
         print(text)
         append_to_log(text)
         print(f"\n  ↳ Appended to {LOG_FILE}")
     else:
         # ── live mode ────────────────────────────────────────────────────────
-        print(f"  Live mode — polling every {args.interval}s  (Ctrl-C to stop)")
-        iteration = 0
-        try:
-            while True:
-                iteration += 1
-                text, done = _run_once()
-                _clear_screen()
-                print(text)
-                print(f"\n  [live]  iteration #{iteration}  |  next refresh in {args.interval}s  |  Ctrl-C to stop")
-                if done:
+        if job_id:
+            # Explicit job_id supplied — go straight to timeline view
+            print(f"  Live mode — polling every {args.interval}s  (Ctrl-C to stop)")
+            iteration = 0
+            text = ""
+            try:
+                while True:
+                    iteration += 1
+                    text, done = _run_once(job_id)
+                    _clear_screen()
+                    print(text)
+                    print(f"\n  [live]  iteration #{iteration}  |  next refresh in {args.interval}s  |  Ctrl-C to stop")
+                    if done:
+                        append_to_log(text)
+                        print(f"\n  ✓ Stage ⑨ seen — job complete. Appended to {LOG_FILE}")
+                        break
+                    time.sleep(args.interval)
+            except KeyboardInterrupt:
+                print("\n  Stopped by user.")
+                if text:
                     append_to_log(text)
-                    print(f"\n  ✓ Stage ⑨ seen — job complete. Appended to {LOG_FILE}")
-                    break
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("\n  Stopped by user.")
-            # Append the last snapshot
-            append_to_log(text)
-            print(f"  ↳ Last snapshot appended to {LOG_FILE}")
+                    print(f"  ↳ Last snapshot appended to {LOG_FILE}")
+        else:
+            # Auto-detect mode — first wait for a NEW job to appear, then watch it
+            script_start = datetime.now(timezone.utc)
+            bucket_url   = f"s3://{S3_BUCKET}/incoming/"
+            print(f"  Live mode — waiting for a new job to appear in {bucket_url}")
+            print(f"  (started at {_fmt_ts(script_start)} · polling every {args.interval}s · Ctrl-C to stop)")
+
+            # Phase 1: wait for a brand-new upload
+            wait_iter = 0
+            text = ""
+            try:
+                while True:
+                    wait_iter += 1
+                    found = discover_job_id(since=script_start)
+                    if found:
+                        job_id, ts = found
+                        _clear_screen()
+                        print(f"  ✓ New job detected: {job_id}  (uploaded {_fmt_ts(ts)})")
+                        print(f"  → switching to timeline view  (polling every {args.interval}s)\n")
+                        break
+                    elapsed = int((datetime.now(timezone.utc) - script_start).total_seconds())
+                    print(f"\r  ⏳  no new job yet  ({elapsed}s elapsed) …", end="", flush=True)
+                    time.sleep(args.interval)
+
+                # Phase 2: live timeline for the discovered job
+                iteration = 0
+                while True:
+                    iteration += 1
+                    text, done = _run_once(job_id)
+                    _clear_screen()
+                    print(text)
+                    print(f"\n  [live]  iteration #{iteration}  |  next refresh in {args.interval}s  |  Ctrl-C to stop")
+                    if done:
+                        append_to_log(text)
+                        print(f"\n  ✓ Stage ⑨ seen — job complete. Appended to {LOG_FILE}")
+                        break
+                    time.sleep(args.interval)
+
+            except KeyboardInterrupt:
+                print("\n  Stopped by user.")
+                if text:
+                    append_to_log(text)
+                    print(f"  ↳ Last snapshot appended to {LOG_FILE}")
 
 
 if __name__ == "__main__":
