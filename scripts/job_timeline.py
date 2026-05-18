@@ -281,6 +281,109 @@ def _parse_worker_log_lines(raw: str, job_id: str) -> list[tuple[datetime, str]]
     return out
 
 
+# ── HEYEX polling-stall detector ────────────────────────────────────────────
+
+_VERBOSE_LOG_PATH = r"C:\HEYEX\logfiles\MCAshvinsWorkstation.verbose.log"
+
+# How long after [7] without any verbose-log activity before we declare a stall
+_STALL_GRACE_SECONDS = 120   # 2 minutes — generous; real pickup usually < 30 s
+
+
+def _verbose_log_entries_since(since_utc: datetime, window_seconds: int = 300) -> list[str]:
+    """
+    Return lines from MCAshvinsWorkstation.verbose.log whose timestamp is
+    >= since_utc (CEST) via SSM.  Returns [] if the log is empty, missing,
+    or the SSM call fails.
+
+    We only ask for lines in [since_utc − 10s, now] to keep the PowerShell
+    snippet fast — avoiding reading megabytes of history.
+    """
+    # Convert to CEST for the PowerShell datetime comparison
+    since_cest = since_utc.astimezone(CEST)
+    # Format: '2026-05-18 14:01:00'
+    since_str = since_cest.strftime("%Y-%m-%d %H:%M:%S")
+
+    ps = (
+        r'$log = "' + _VERBOSE_LOG_PATH + r'"; '
+        r'$start = Get-Date "' + since_str + r'"; '
+        r'if (-not (Test-Path $log)) { "LOG_NOT_FOUND"; exit } '
+        r'Get-Content $log -ErrorAction SilentlyContinue | '
+        r'  Where-Object { '
+        r'    $line = $_; '
+        r'    if ($line -match "^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)") { '
+        r'      try { (Get-Date $matches[1]) -ge $start } catch { $false } '
+        r'    } else { $false } '
+        r'  } | Select-Object -Last 10'
+    )
+    raw = ssm_run(HEYEX2_INSTANCE, ps, timeout=40)
+    if raw.startswith("[SSM") or "LOG_NOT_FOUND" in raw:
+        return []
+    return [l for l in raw.splitlines() if l.strip()]
+
+
+def check_polling_stall(stage7_ts: Optional[datetime]) -> Optional[str]:
+    """
+    Return a human-readable stall warning string if the HEYEX AppWay Link
+    polling thread appears to have frozen, or None if everything looks normal.
+
+    Decision rule:
+      • stage [7] (result enqueued) was seen AND
+      • > _STALL_GRACE_SECONDS have elapsed since [7] AND
+      • MCAshvinsWorkstation.verbose.log has zero new lines since [7]
+
+    This is the exact failure pattern observed on 2026-05-18: the backend
+    completed in 40 s but the verbose log went silent at 12:32:23 and
+    AppWay Link never polled the results queue.
+
+    Returns a multi-line string suitable for printing + logging, e.g.:
+
+        🛑  HEYEX polling stall detected
+            Verbose log: no entries since 13:46:45 CEST (> 2m after [7])
+            → MCAshvinsWorkstation.polling thread / WebView2 is not running
+            Recovery:
+              Option A — restart via SSM (interactive session required):
+                python scripts/ssm_run.py --instance heyex2 -- ...
+              Option B — RDP + manual restart (reliable):
+                scripts/rdp-heyex.sh
+    """
+    if stage7_ts is None:
+        return None
+    elapsed = (datetime.now(timezone.utc) - stage7_ts).total_seconds()
+    if elapsed < _STALL_GRACE_SECONDS:
+        return None
+
+    recent = _verbose_log_entries_since(stage7_ts)
+    if recent:
+        # Verbose log is active — not a stall
+        return None
+
+    stage7_cest = _to_cest(stage7_ts).strftime("%H:%M:%S CEST")
+    elapsed_min  = int(elapsed) // 60
+    elapsed_sec  = int(elapsed) % 60
+    elapsed_str  = f"{elapsed_min}m {elapsed_sec:02d}s" if elapsed_min else f"{elapsed_sec}s"
+
+    return (
+        f"\n  🛑  HEYEX polling stall detected\n"
+        f"      Verbose log: no new entries since {stage7_cest} (> {elapsed_str} after [7])\n"
+        f"      → MCAshvinsWorkstation polling thread / WebView2 is not initialised\n"
+        f"        (this happens when the process was restarted via SSM without an\n"
+        f"         interactive desktop session — WebView2 needs a logged-in user)\n"
+        f"\n"
+        f"      Recovery options\n"
+        f"      ────────────────\n"
+        f"      A) RDP in and restart manually (most reliable):\n"
+        f"           scripts/rdp-heyex.sh\n"
+        f"         Then in Task Manager / PowerShell:\n"
+        f"           Stop-Process -Name MCAshvinsWorkstation -Force\n"
+        f"           Start-Process 'C:\\...\\MCAshvinsWorkstation.exe'\n"
+        f"\n"
+        f"      B) SSM restart (only works if desktop session already active):\n"
+        f"           python scripts/ssm_run.py --instance heyex2 -- \\\n"
+        f"             'Stop-Process -Name MCAshvinsWorkstation -Force; Start-Sleep 3; "
+        f"<path>'\n"
+    )
+
+
 # ── heyex2 log grep ──────────────────────────────────────────────────────────
 
 _HEYEX_LOG_DIR  = r"C:\HEYEX\logfiles"
@@ -836,6 +939,8 @@ def main():
     origin: Optional[datetime] = None
     last_new_event_time = time.monotonic()
     stage6_seen = False   # idle clock starts after stage [6] (result on S3)
+    stage7_ts: Optional[datetime] = None   # timestamp of [7], used by stall detector
+    stall_warned = False   # print stall warning at most once per run
 
     try:
         while True:
@@ -877,6 +982,8 @@ def main():
                 last_new_event_time = time.monotonic()
                 if st.number == "6":
                     stage6_seen = True
+                if st.number == "7" and stage7_ts is None:
+                    stage7_ts = st.ts
                 # Small inter-line delay so stages trickle in visually rather
                 # than bursting all at once when a poll catches multiple events.
                 if new_stages.index(st) < len(new_stages) - 1:
@@ -923,6 +1030,16 @@ def main():
                     _log_write(summary)
                     _log_write(SEP)
                     break
+                # ── polling-stall check (once, after grace period) ──────────
+                if not stall_warned and stage7_ts is not None:
+                    stall_msg = check_polling_stall(stage7_ts)
+                    if stall_msg is not None:
+                        # Clear countdown line, then print the warning
+                        print("\r\033[K", end="", flush=True)
+                        print(stall_msg)
+                        _log_write(stall_msg)
+                        stall_warned = True
+
                 # show countdown on a single overwriting line; indicate which stage we're waiting for
                 mins, secs = divmod(remaining, 60)
                 countdown = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
