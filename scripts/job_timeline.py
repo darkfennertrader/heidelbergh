@@ -8,16 +8,16 @@ back in HEYEX — and appends it to  logs/workflow.logs.
 
 Stages covered
 ──────────────
-  ①  DICOM received by AppWay Link               heyex2 AppWay Link log
-  ②  DICOM uploaded to S3 incoming/              S3 object LastModified
-  ③  Job message enqueued on SQS appway-jobs     (derived: ~= stage ②)
-  ④  Input downloaded by backend                 backend journalctl / STAGE 4/9
-  ⑤  Backend processes (YOLO + ePDF)             backend journalctl / STAGE 5/9
-  ⑥  Result uploaded to S3 results/             S3 object LastModified + STAGE 6/9
-  ⑦  Result message enqueued on appway-results   backend journalctl / STAGE 7/9
-  ⑧  Result downloaded by AppWay Link            heyex2 AppWay Link log
-  ⑨  Result stored into HEYEX                    heyex2 MCAshvinsWorkstation log
-  ✗  (if present) user-click failure             heyex2 MCAshvinsWorkstation log
+  [1]  DICOM received by AppWay Link               heyex2 AppWay Link log
+  [2]  DICOM uploaded to S3 incoming/              S3 object LastModified
+  [3]  Job message enqueued on SQS appway-jobs     (derived: ~= stage [2])
+  [4]  Input downloaded by backend                 /var/log/appway-worker.log
+  [5]  Backend processes (YOLO + ePDF)             /var/log/appway-worker.log
+  [6]  Result uploaded to S3 results/              S3 object LastModified
+  [7]  Result message enqueued on appway-results   /var/log/appway-worker.log
+  [8]  Result downloaded by AppWay Link            heyex2 AshvinsDistribution dir
+  [9]  Result stored into HEYEX                    heyex2 MCAshvinsWorkstation log
+  [X]  (if present) user-click failure             heyex2 MCAshvinsWorkstation log
 
 Usage
 ─────
@@ -30,14 +30,14 @@ Usage
   # Explicit job id, one-shot:
   python scripts/job_timeline.py <job-id>
 
-  # Explicit job id, live mode (re-query every 5 s, redraw until stage ⑨ seen or Ctrl-C):
+  # Explicit job id, live mode:
   python scripts/job_timeline.py <job-id> --live
 
   # UTC-only timestamps (default: CEST primary + UTC secondary):
   python scripts/job_timeline.py <job-id> --utc-only
 
-  # Custom poll interval (--live only, seconds):
-  python scripts/job_timeline.py <job-id> --live --interval 10
+  # Custom poll interval and idle timeout (--live only):
+  python scripts/job_timeline.py --live --interval 10 --idle-timeout 120
 
 Environment
 ───────────
@@ -51,7 +51,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -72,22 +71,23 @@ import boto3
 from botocore.exceptions import ClientError
 
 # ── constants ──────────────────────────────────────────────────────────────
-AWS_REGION   = os.getenv("AWS_REGION", "eu-west-1")
-S3_BUCKET    = os.getenv("S3_BUCKET",  "appway-bridge-prod")
-HEYEX2_INSTANCE = "i-02a7dd1797d85a099"
+AWS_REGION       = os.getenv("AWS_REGION", "eu-west-1")
+S3_BUCKET        = os.getenv("S3_BUCKET",  "appway-bridge-prod")
+HEYEX2_INSTANCE  = "i-02a7dd1797d85a099"
 BACKEND_INSTANCE = "i-02a99abeba370f0a7"
 
 CEST = timezone(timedelta(hours=2), "CEST")   # Europe/Berlin summer time (UTC+2)
 
-LOGS_DIR  = _PROJECT_ROOT / "logs"
-LOG_FILE  = LOGS_DIR / "workflow.logs"
+LOGS_DIR = _PROJECT_ROOT / "logs"
+LOG_FILE = LOGS_DIR / "workflow.logs"
 
 SSM_TIMEOUT = 30   # seconds to wait for an SSM command to complete
+
+SEP = "=" * 72   # plain ASCII separator (works in every font)
 
 # ── timezone helpers ────────────────────────────────────────────────────────
 
 def _to_cest(dt: datetime) -> datetime:
-    """Convert any aware datetime to CEST (UTC+2)."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(CEST)
@@ -95,27 +95,24 @@ def _to_cest(dt: datetime) -> datetime:
 
 def _fmt_ts(dt: datetime, utc_only: bool = False) -> str:
     """
-    Format a timestamp.
-
-      default   → '2026-05-18 00:45:39 CEST  (22:45:39 UTC)'
-      utc_only  → '2026-05-18 22:45:39 UTC'
+    default  → '2026-05-18 10:02:16 CEST  (08:02:16 UTC)'
+    utc_only → '2026-05-18 08:02:16 UTC'
     """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    utc = dt.astimezone(timezone.utc)
+    utc  = dt.astimezone(timezone.utc)
     if utc_only:
         return utc.strftime("%Y-%m-%d %H:%M:%S UTC")
     cest = _to_cest(dt)
-    return (
-        cest.strftime("%Y-%m-%d %H:%M:%S CEST")
-        + "  ("
-        + utc.strftime("%H:%M:%S UTC")
-        + ")"
-    )
+    return cest.strftime("%Y-%m-%d %H:%M:%S CEST") + "  (" + utc.strftime("%H:%M:%S UTC") + ")"
+
+
+def _fmt_ts_short(dt: datetime) -> str:
+    """Short CEST time used in streaming lines: '10:02:16 CEST'."""
+    return _to_cest(dt).strftime("%H:%M:%S CEST")
 
 
 def _fmt_delta(seconds: float) -> str:
-    """Format elapsed seconds as +HH:MM:SS."""
     s = int(abs(seconds))
     h, rem = divmod(s, 3600)
     m, sc  = divmod(rem, 60)
@@ -123,12 +120,20 @@ def _fmt_delta(seconds: float) -> str:
 
 
 def _fmt_size(n: int) -> str:
-    """Human-readable file size."""
     if n < 1024:
         return f"{n} B"
     if n < 1024 * 1024:
         return f"{n/1024:.1f} KB"
     return f"{n/1024/1024:.2f} MB"
+
+
+# ── log-file helpers ─────────────────────────────────────────────────────────
+
+def _log_write(line: str) -> None:
+    """Append a single line (+ newline) to logs/workflow.logs, creating it if needed."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
 
 
 # ── AWS helpers ─────────────────────────────────────────────────────────────
@@ -143,16 +148,14 @@ def _ssm():
 
 def discover_job_id(since: Optional[datetime] = None) -> Optional[tuple[str, datetime]]:
     """
-    Find the most recent job_id in S3 incoming/.
+    Find the most-recent job_id in S3 incoming/.
 
-    If *since* is given (UTC-aware datetime), only jobs whose newest S3 object
-    was uploaded **after** that moment are considered.  This lets --live mode
-    wait for a brand-new job to appear.
+    If *since* is given (UTC-aware), only jobs uploaded **after** that moment
+    are considered — lets --live wait for a brand-new job.
 
-    Returns (job_id, last_modified_utc) or None when no qualifying job exists.
+    Returns (job_id, last_modified_utc) or None.
     """
     objs = s3_list_prefix("incoming/")
-    # key format: incoming/<job_id>/<filename>
     by_job: dict[str, datetime] = {}
     for o in objs:
         parts = o["key"].split("/", 2)
@@ -171,30 +174,25 @@ def discover_job_id(since: Optional[datetime] = None) -> Optional[tuple[str, dat
 
 
 def s3_list_prefix(prefix: str) -> list[dict]:
-    """Return all S3 objects under prefix as list of {key, size, last_modified}."""
     client = _s3()
     results = []
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             if obj["Key"] == prefix:
-                continue  # skip placeholder directory object
+                continue
             results.append({
                 "key":           obj["Key"],
                 "size":          obj["Size"],
-                "last_modified": obj["LastModified"],  # always UTC-aware from boto3
+                "last_modified": obj["LastModified"],
             })
     return results
 
 
 def s3_head(key: str) -> Optional[dict]:
-    """Return {size, last_modified} for a single S3 key, or None if not found."""
     try:
         resp = _s3().head_object(Bucket=S3_BUCKET, Key=key)
-        return {
-            "size":          resp["ContentLength"],
-            "last_modified": resp["LastModified"],
-        }
+        return {"size": resp["ContentLength"], "last_modified": resp["LastModified"]}
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         if code in ("404", "NoSuchKey", "NotFound"):
@@ -205,19 +203,8 @@ def s3_head(key: str) -> Optional[dict]:
 # ── SSM helper ───────────────────────────────────────────────────────────────
 
 def ssm_run(instance_id: str, command: str, timeout: int = SSM_TIMEOUT) -> str:
-    """
-    Run a shell command on an EC2 instance via AWS SSM and return stdout.
-    Returns an empty string on error / timeout rather than raising.
-
-    For Windows instances the command must be PowerShell syntax — pass
-    document_name="AWS-RunPowerShellScript".
-    For Linux, document_name="AWS-RunShellScript".
-    """
-    # Auto-detect platform by instance prefix heuristics is tricky;
-    # we know exactly which is which, so hard-code doc name per instance.
     is_windows = (instance_id == HEYEX2_INSTANCE)
     doc = "AWS-RunPowerShellScript" if is_windows else "AWS-RunShellScript"
-
     client = _ssm()
     try:
         resp = client.send_command(
@@ -230,15 +217,11 @@ def ssm_run(instance_id: str, command: str, timeout: int = SSM_TIMEOUT) -> str:
     except Exception as exc:
         return f"[SSM send_command failed: {exc}]"
 
-    # Poll for completion
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(2)
         try:
-            inv = client.get_command_invocation(
-                CommandId=command_id,
-                InstanceId=instance_id,
-            )
+            inv    = client.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
             status = inv["Status"]
             if status in ("Success", "Failed", "Cancelled", "TimedOut"):
                 return (inv.get("StandardOutputContent") or "").strip()
@@ -246,34 +229,18 @@ def ssm_run(instance_id: str, command: str, timeout: int = SSM_TIMEOUT) -> str:
             continue
         except Exception as exc:
             return f"[SSM poll failed: {exc}]"
-
     return "[SSM timed out]"
 
 
 # ── backend log grep ─────────────────────────────────────────────────────────
-#
-# The worker is configured with:
-#   StandardOutput=append:/var/log/appway-worker.log
-# Log line format:
-#   2026-05-18T05:37:24 [INFO] appway_backend.worker: [job_id] message
-# Timestamps are UTC (no tz suffix).
 
-_WORKER_LOG = Path("/var/log/appway-worker.log")
-
-# Local log line regex:  "2026-05-18T05:37:24 [INFO] module: msg"
+_WORKER_LOG    = Path("/var/log/appway-worker.log")
 _WORKER_LOG_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s+\[(?:INFO|WARNING|ERROR|DEBUG)\]\s+\S+:\s+(.*)"
 )
 
 
 def journal_grep(job_id: str) -> list[tuple[datetime, str]]:
-    """
-    Pull appway-worker log lines that contain job_id.
-    Returns list of (utc_datetime, message) sorted by time.
-
-    Tries local /var/log/appway-worker.log first.
-    Falls back to SSM grep on BACKEND_INSTANCE if not available locally.
-    """
     lines = _local_worker_log_grep(job_id)
     if lines is None:
         lines = _ssm_worker_log_grep(job_id)
@@ -281,18 +248,15 @@ def journal_grep(job_id: str) -> list[tuple[datetime, str]]:
 
 
 def _local_worker_log_grep(job_id: str) -> Optional[list[tuple[datetime, str]]]:
-    """Read /var/log/appway-worker.log locally if it exists."""
     if not _WORKER_LOG.exists():
         return None
     try:
-        raw = _WORKER_LOG.read_text(errors="replace")
-        return _parse_worker_log_lines(raw, job_id)
+        return _parse_worker_log_lines(_WORKER_LOG.read_text(errors="replace"), job_id)
     except Exception:
         return None
 
 
 def _ssm_worker_log_grep(job_id: str) -> list[tuple[datetime, str]]:
-    """Grep the backend worker log via SSM (Linux)."""
     cmd = f"grep -F '{job_id}' /var/log/appway-worker.log 2>/dev/null | tail -500"
     raw = ssm_run(BACKEND_INSTANCE, cmd, timeout=60)
     if raw.startswith("[SSM"):
@@ -308,60 +272,34 @@ def _parse_worker_log_lines(raw: str, job_id: str) -> list[tuple[datetime, str]]
         m = _WORKER_LOG_RE.match(line)
         if not m:
             continue
-        ts_str, msg = m.group(1), m.group(2)
         try:
-            # Timestamps in the log are UTC (no tz suffix)
-            dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-        out.append((dt, msg))
+        out.append((dt, m.group(2)))
     out.sort(key=lambda x: x[0])
     return out
 
 
 # ── heyex2 log grep ──────────────────────────────────────────────────────────
 
-_HEYEX_LOG_DIR = r"C:\HEYEX\logfiles"   # note: lowercase on this instance
-_APPWAY_LOG_DIR = r"C:\HEYEX\AshvinsDistribution"   # AppWay/AI Marketplace drop dir
-
-_HEYEX_TS_RE = re.compile(
-    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)"  # "2026-05-17 23:02:02.229"
-)
+_HEYEX_LOG_DIR  = r"C:\HEYEX\logfiles"
+_APPWAY_LOG_DIR = r"C:\HEYEX\AshvinsDistribution"
+_HEYEX_TS_RE    = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)")
 
 
 def _parse_heyex_ts(ts_str: str) -> Optional[datetime]:
-    """
-    Parse a HEYEX/AppWay timestamp that is in LOCAL TIME (CEST = UTC+2).
-    Returns UTC-aware datetime.
-    """
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
         try:
-            local_dt = datetime.strptime(ts_str.strip(), fmt)
-            # HEYEX 2 is configured as CEST (UTC+2)
-            cest_dt = local_dt.replace(tzinfo=CEST)
-            return cest_dt.astimezone(timezone.utc)
+            return datetime.strptime(ts_str.strip(), fmt).replace(tzinfo=CEST).astimezone(timezone.utc)
         except ValueError:
             continue
     return None
 
 
-def _heyex_grep(job_id: str, result_filename: str, job_origin_ts: Optional[datetime] = None) -> dict:
-    """
-    Grep heyex2 Windows logs via SSM PowerShell.
-
-    Returns a dict with optional keys:
-      'dicom_received'  : (utc_dt, filepath, size_bytes)
-      'result_stored'   : (utc_dt, filepath, size_bytes)
-      'click_error'     : (utc_dt, bad_path, error_msg)
-    """
+def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
     found: dict = {}
 
-    # ── MCAshvinsWorkstation.verbose.log — result stored + click error ──────
-    # The verbose.log has lines like:
-    #   2026-05-18 07:47:41.967  10756  166  MiiiDcmFile  constructor  error, couldn't open file \\host\ImagwPool\...
-    #   2026-05-18 07:47:41.978  10756  166  MCLogFile    LogException ...  prepare \\host\ImagwPool\...
-    # We target lines with "couldn't open file" (has timestamp + UNC path on same line)
-    # and lines with "ImagwPool" but NOT "couldn't" (= successful store).
     ps_heyex = (
         r'$log = "' + _HEYEX_LOG_DIR + r'\MCAshvinsWorkstation.verbose.log"; '
         r'if (Test-Path $log) { '
@@ -371,29 +309,18 @@ def _heyex_grep(job_id: str, result_filename: str, job_origin_ts: Optional[datet
     heyex_out = ssm_run(HEYEX2_INSTANCE, ps_heyex)
 
     for line in heyex_out.splitlines():
-        ts_m = _HEYEX_TS_RE.search(line)
-        ts = _parse_heyex_ts(ts_m.group(1)) if ts_m else None
-
+        ts_m  = _HEYEX_TS_RE.search(line)
+        ts    = _parse_heyex_ts(ts_m.group(1)) if ts_m else None
         path_m = re.search(r'(\\\\[^\s\t<>]+\.dcm|C:\\[^\s\t<>]+\.dcm)', line, re.IGNORECASE)
 
-        # "couldn't open file" → WebView2 click error (has timestamp + UNC path)
-        # Only record errors within ±2h of the job to avoid stale entries from old jobs.
         if "couldn't open file" in line.lower() or "could not read the dicom" in line.lower():
             bad_path = path_m.group(1) if path_m else "(unknown path)"
             if "click_error" not in found and ts is not None:
                 if job_origin_ts is None or abs((ts - job_origin_ts).total_seconds()) < 7200:
                     found["click_error"] = (ts, bad_path, line.strip()[:200])
-
-        # ImagwPool without error → result was written/stored in HEYEX (has timestamp)
         elif "ImagwPool" in line and ts is not None and "result_stored" not in found:
-            path = path_m.group(1) if path_m else "?"
-            found["result_stored"] = (ts, path, None)
+            found["result_stored"] = (ts, path_m.group(1) if path_m else "?", None)
 
-    # ── AshvinsDistribution dir — infer ① and ⑧ from file timestamps ───────
-    # AppWay Link drops the incoming ZIP and sends back a .rtc.dcm response.
-    # The ZIP arrival ≈ stage ⑧ (result downloaded), the .rtc.dcm ≈ stage ①
-    # For stage ①: match the incoming DICOM upload time (≈ S3 stage ② time)
-    # We infer from AshvinsDistribution file timestamps near our job time.
     ps_appway = (
         r'$dir = "' + _APPWAY_LOG_DIR + r'"; '
         r'if (Test-Path $dir) { '
@@ -404,284 +331,219 @@ def _heyex_grep(job_id: str, result_filename: str, job_origin_ts: Optional[datet
     )
     appway_out = ssm_run(HEYEX2_INSTANCE, ps_appway)
 
-    # Parse the table output to find ZIP file (= result downloaded by AppWay Link)
-    # Format: "Name   Length   LastWriteTime"
     for line in appway_out.splitlines():
-        # Look for a .zip file (AppWay result delivery)
         if ".zip" in line.lower() and "result_downloaded" not in found:
-            # Extract timestamp from Format-Table output: last column is date/time
             ts_m = re.search(r'(\d+/\d+/\d{4}\s+\d+:\d+:\d+\s+[AP]M)', line)
             if ts_m:
                 try:
-                    local_dt = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p")
-                    ts = local_dt.replace(tzinfo=CEST).astimezone(timezone.utc)
+                    ts = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=CEST).astimezone(timezone.utc)
                     found["result_downloaded"] = (ts, line.strip())
                 except ValueError:
                     pass
-
-        # Look for .rtc.dcm (AppWay Link confirmation sent back to HEYEX → ≈ stage ⑨)
         if ".rtc.dcm" in line.lower() and "result_stored" not in found:
             ts_m = re.search(r'(\d+/\d+/\d{4}\s+\d+:\d+:\d+\s+[AP]M)', line)
             if ts_m:
                 try:
-                    local_dt = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p")
-                    ts = local_dt.replace(tzinfo=CEST).astimezone(timezone.utc)
+                    ts = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=CEST).astimezone(timezone.utc)
                     found["result_stored"] = (ts, f"AshvinsDistribution/{line.split()[0]}", None)
                 except ValueError:
                     pass
 
-    # Stage ① (DICOM received by AppWay Link): infer from incoming S3 time + small offset
-    # AppWay Link polls SQS, so ① ≈ ② + SQS polling delay (typically < 30s)
-    # We mark it as "inferred" if we can't find it in logs directly.
-
     return found
 
 
-def _ssm_file_size(win_path: str) -> Optional[int]:
-    """Get file size in bytes for a Windows path via SSM, or None."""
-    ps = f'(Get-Item "{win_path}" -ErrorAction SilentlyContinue).Length'
-    out = ssm_run(HEYEX2_INSTANCE, ps).strip()
-    try:
-        return int(out)
-    except (ValueError, TypeError):
-        return None
+# ── Stage dataclass ───────────────────────────────────────────────────────────
+
+class Stage:
+    # Maps internal number strings to display tags
+    _TAG: dict[str, str] = {
+        "1": "[1]", "2": "[2]", "3": "[3]", "4": "[4]", "5": "[5]",
+        "6": "[6]", "7": "[7]", "8": "[8]", "9": "[9]", "X": "[X]",
+    }
+
+    def __init__(self, number: str, label: str, ts: Optional[datetime] = None, detail: str = ""):
+        self.number = number   # "1".."9" or "X"
+        self.label  = label
+        self.ts     = ts       # UTC-aware or None
+        self.detail = detail
+
+    @property
+    def tag(self) -> str:
+        return self._TAG.get(self.number, f"[{self.number}]")
 
 
 # ── timeline builder ─────────────────────────────────────────────────────────
 
-class Stage:
-    def __init__(
-        self,
-        number: str,
-        label: str,
-        ts: Optional[datetime] = None,
-        detail: str = "",
-    ):
-        self.number = number   # e.g. "①" or "✗"
-        self.label  = label
-        self.ts     = ts       # UTC-aware datetime or None
-        self.detail = detail   # extra path / size info
-
-
 def build_timeline(job_id: str) -> list[Stage]:
-    """
-    Query all sources and return a list of Stage objects in chronological order.
-    Stages with ts=None are listed as '(not yet seen)'.
-    """
+    """Query all sources; return Stage list sorted by timestamp (Nones last)."""
     stages: list[Stage] = []
 
     incoming_prefix = f"incoming/{job_id}/"
     result_key      = f"results/{job_id}/result.dcm"
 
-    # ── S3: stage ② — DICOM in incoming/ ────────────────────────────────────
+    # [2] S3 incoming
     s3_incoming = s3_list_prefix(incoming_prefix)
     if s3_incoming:
         first = min(s3_incoming, key=lambda x: x["last_modified"])
-        detail_parts = [f"s3://{S3_BUCKET}/{first['key']}  ({_fmt_size(first['size'])})"]
+        detail = f"s3://{S3_BUCKET}/{first['key']}  ({_fmt_size(first['size'])})"
         if len(s3_incoming) > 1:
             total = sum(o["size"] for o in s3_incoming)
-            detail_parts.append(f"  … {len(s3_incoming)} file(s) total, {_fmt_size(total)}")
-        stages.append(Stage("②", "DICOM uploaded to S3", first["last_modified"], "\n            ".join(detail_parts)))
+            detail += f"\n  ... {len(s3_incoming)} file(s) total, {_fmt_size(total)}"
+        stages.append(Stage("2", "DICOM uploaded to S3", first["last_modified"], detail))
     else:
-        stages.append(Stage("②", "DICOM uploaded to S3", None, f"s3://{S3_BUCKET}/{incoming_prefix}  (not found)"))
+        stages.append(Stage("2", "DICOM uploaded to S3", None, f"s3://{S3_BUCKET}/{incoming_prefix}  (not found)"))
 
-    # ── S3: stage ⑥ — result in results/ ────────────────────────────────────
+    # [6] S3 result
     s3_result = s3_head(result_key)
     if s3_result:
-        stages.append(Stage("⑥", "ePDF result uploaded to S3", s3_result["last_modified"],
+        stages.append(Stage("6", "ePDF result uploaded to S3", s3_result["last_modified"],
                             f"s3://{S3_BUCKET}/{result_key}  ({_fmt_size(s3_result['size'])})"))
     else:
-        stages.append(Stage("⑥", "ePDF result uploaded to S3", None,
+        stages.append(Stage("6", "ePDF result uploaded to S3", None,
                             f"s3://{S3_BUCKET}/{result_key}  (not yet present)"))
 
-    # ── Backend journal: stages ④, ⑤, ⑦ ────────────────────────────────────
+    # [4] [5] [7] from backend worker log
     journal = journal_grep(job_id)
 
-    def _find_journal(pattern: str) -> Optional[datetime]:
+    def _find(pattern: str) -> Optional[datetime]:
         for dt, msg in journal:
             if pattern in msg:
                 return dt
         return None
 
-    def _find_journal_kv(pattern: str, key: str) -> Optional[str]:
-        for _, msg in journal:
-            if pattern in msg:
-                m = re.search(key + r"=(\S+)", msg)
-                if m:
-                    return m.group(1)
-        return None
-
-    # ── Stage ④ — backend download ─────────────────────────────────────────
-    # Match: "Downloaded N file(s) from s3://…/incoming/job_id/" OR "Downloading input"
-    dl_ts = _find_journal("Downloaded") or _find_journal("Downloading input")
+    # [4] download
+    dl_ts     = _find("Downloaded") or _find("Downloading input")
     dl_detail = ""
     for _, msg in journal:
         if "Downloaded" in msg and "incoming/" in msg:
-            # "Downloaded 1 file(s) from s3://bucket/incoming/job_id/"
             m = re.search(r"Downloaded (\d+) file\(s\) from (s3://\S+)", msg)
             if m:
                 dl_detail = f"{m.group(2)}  ({m.group(1)} file(s))"
             break
-    stages.append(Stage("④", "Input downloaded by backend", dl_ts, dl_detail))
+    stages.append(Stage("4", "Input downloaded by backend", dl_ts, dl_detail))
 
-    # ── Stage ⑤ — processing ───────────────────────────────────────────────
-    # Start: "Processing…"  Done: "Processor complete" or "Inference result"
-    proc_start = _find_journal("Processing\u2026") or _find_journal("Processing DICOM")
-    proc_done  = _find_journal("Processor complete") or _find_journal("ePDF DICOM saved")
+    # [5] processing
+    proc_start  = _find("Processing\u2026") or _find("Processing DICOM")
+    proc_done   = _find("Processor complete") or _find("ePDF DICOM saved")
     proc_detail = ""
     if proc_start and proc_done:
-        elapsed = (proc_done - proc_start).total_seconds()
-        proc_detail = f"duration {elapsed:.1f}s"
-    # Look for inference result detail
+        proc_detail = f"duration {(proc_done - proc_start).total_seconds():.1f}s"
     for _, msg in journal:
         if "Inference result:" in msg:
             proc_detail = msg.split("] ", 1)[-1] if "] " in msg else msg
             break
-    stages.append(Stage("⑤", "Backend processes (YOLO + ePDF)", proc_done or proc_start, proc_detail))
+    stages.append(Stage("5", "Backend processes (YOLO + ePDF)", proc_done or proc_start, proc_detail))
 
-    # ── Stage ⑥ upload + ⑦ enqueue ────────────────────────────────────────
-    up_ts = _find_journal("Uploaded 1 file") or _find_journal("Uploading output")
+    # [6] upload detail merge  + [7] enqueue
+    up_ts     = _find("Uploaded 1 file") or _find("Uploading output")
     up_detail = ""
     for _, msg in journal:
         if "Uploaded" in msg and "results/" in msg:
             m = re.search(r"Uploaded \d+ file\(s\) to (s3://\S+)", msg)
             if m:
-                up_detail = f"{m.group(1)}"
+                up_detail = m.group(1)
             break
-
-    # Merge with S3 LastModified (S3 is authoritative for timing)
     if not up_ts and s3_result:
         up_ts = s3_result["last_modified"]
     if s3_result and not up_detail:
         up_detail = f"s3://{S3_BUCKET}/{result_key}  ({_fmt_size(s3_result['size'])})"
-    # Update stage ⑥ in place with journal detail if we got it
     for st in stages:
-        if st.number == "⑥" and not st.detail.startswith("(not"):
+        if st.number == "6" and not st.detail.startswith("(not"):
             if up_detail:
                 st.detail = up_detail
             if up_ts and not st.ts:
                 st.ts = up_ts
 
-    enq_ts = _find_journal("Sent result message")
+    enq_ts     = _find("Sent result message")
     enq_detail = ""
     for _, msg in journal:
         if "Sent result message" in msg:
             enq_detail = msg.split("] ", 1)[-1] if "] " in msg else msg
             break
-    stages.append(Stage("⑦", "Result enqueued on SQS appway-results", enq_ts, enq_detail))
+    stages.append(Stage("7", "Result enqueued on SQS appway-results", enq_ts, enq_detail))
 
-    # ── SSM: heyex2 stages ①, ⑧, ⑨ ─────────────────────────────────────────
-    # result_fname: used to grep the HEYEX verbose.log for the stored DCM.
-    # AppWay Link names the stored file with a timestamp, not our job_id.
-    # We leave result_fname empty and rely on ImagwPool pattern matching.
-    result_fname = ""
-
-    # Provide S3 incoming timestamp as the "job origin" for heyex time-window filtering
+    # [1] [8] [9] [X] from heyex2 via SSM
     job_origin_ts = s3_incoming[0]["last_modified"] if s3_incoming else None
-    heyex_data = _heyex_grep(job_id, result_fname, job_origin_ts=job_origin_ts)
+    heyex_data    = _heyex_grep(job_id, job_origin_ts=job_origin_ts)
 
-    # Stage ① — DICOM received
     if "dicom_received" in heyex_data:
         ts, path, size = heyex_data["dicom_received"]
-        sz_str = _fmt_size(size) if size else "?"
-        stages.append(Stage("①", "DICOM received by AppWay Link", ts, f"{path}  ({sz_str})"))
+        stages.append(Stage("1", "DICOM received by AppWay Link", ts,
+                            f"{path}  ({_fmt_size(size) if size else '?'})"))
     else:
-        stages.append(Stage("①", "DICOM received by AppWay Link", None, "(not found in AppWay Link logs)"))
+        stages.append(Stage("1", "DICOM received by AppWay Link", None, "(not found in AppWay Link logs)"))
 
-    # Stage ⑧ — result downloaded
     if "result_downloaded" in heyex_data:
         ts, raw = heyex_data["result_downloaded"]
-        stages.append(Stage("⑧", "Result downloaded by AppWay Link", ts, raw[:120]))
+        stages.append(Stage("8", "Result downloaded by AppWay Link", ts, raw[:120]))
     else:
-        stages.append(Stage("⑧", "Result downloaded by AppWay Link", None, "(not found in AppWay Link logs)"))
+        stages.append(Stage("8", "Result downloaded by AppWay Link", None, "(not found in AppWay Link logs)"))
 
-    # Stage ⑨ — stored in HEYEX
     if "result_stored" in heyex_data:
         ts, path, size = heyex_data["result_stored"]
-        sz_str = _fmt_size(size) if size else "?"
-        stages.append(Stage("⑨", "Result stored in HEYEX", ts, f"{path}  ({sz_str})"))
+        stages.append(Stage("9", "Result stored in HEYEX", ts,
+                            f"{path}  ({_fmt_size(size) if size else '?'})"))
     else:
-        stages.append(Stage("⑨", "Result stored in HEYEX", None, "(not found in MCAshvinsWorkstation log)"))
+        stages.append(Stage("9", "Result stored in HEYEX", None, "(not found in MCAshvinsWorkstation log)"))
 
-    # Stage ✗ — click error (optional)
     if "click_error" in heyex_data:
         ts, bad_path, msg = heyex_data["click_error"]
-        stages.append(Stage("✗", "User-click failure (ThreadLoadDICOMReport)", ts,
-                            f"Tried to open: {bad_path}\n            {msg[:200]}"))
+        stages.append(Stage("X", "User-click failure (can't reach this page)", ts,
+                            f"Tried to open: {bad_path}\n  {msg[:200]}"))
 
-    # ── Sort by timestamp (Nones go to end) ─────────────────────────────────
-    def _sort_key(st: Stage):
-        if st.ts is None:
-            return datetime.max.replace(tzinfo=timezone.utc)
-        return st.ts
-
-    stages.sort(key=_sort_key)
+    # sort: timestamped stages first (chronological), None-ts last
+    stages.sort(key=lambda s: s.ts if s.ts is not None else datetime.max.replace(tzinfo=timezone.utc))
     return stages
 
 
-# ── renderer ─────────────────────────────────────────────────────────────────
+# ── one-shot renderer ─────────────────────────────────────────────────────────
 
 def render_timeline(job_id: str, stages: list[Stage], utc_only: bool = False) -> str:
-    """Render stages to a human-readable string."""
     lines: list[str] = []
-    sep = "═" * 72
-
-    lines.append(sep)
+    lines.append(SEP)
     lines.append(f"  AppWay job timeline:  {job_id}")
-    now_str = _fmt_ts(datetime.now(timezone.utc), utc_only)
-    lines.append(f"  Generated at: {now_str}")
-    lines.append(sep)
+    lines.append(f"  Generated at:         {_fmt_ts(datetime.now(timezone.utc), utc_only)}")
+    lines.append(SEP)
 
-    # Find the first real timestamp (origin for Δ)
-    origin: Optional[datetime] = None
-    for st in stages:
-        if st.ts is not None and st.number != "✗":
-            origin = st.ts
-            break
+    origin: Optional[datetime] = next(
+        (s.ts for s in stages if s.ts is not None and s.number != "X"), None
+    )
 
     for st in stages:
         if st.ts is not None:
             ts_str  = _fmt_ts(st.ts, utc_only)
-            delta_s = (st.ts - origin).total_seconds() if origin else 0.0
-            delta   = _fmt_delta(delta_s)
+            delta   = _fmt_delta((st.ts - origin).total_seconds()) if origin else "+00:00:00"
         else:
-            ts_str = "(not yet seen)"
-            delta  = "+??:??:??"
-
-        prefix = f"[{delta}]  {ts_str}"
-        header = f"  {prefix}   {st.number} {st.label}"
-        lines.append(header)
-        if st.detail:
-            for dl in st.detail.split("\n"):
-                lines.append(f"            {dl}")
+            ts_str  = "(not yet seen)"
+            delta   = "+??:??:??"
+        lines.append(f"  [{delta}]  {ts_str}   {st.tag} {st.label}")
+        for dl in st.detail.split("\n"):
+            if dl.strip():
+                lines.append(f"               {dl}")
         lines.append("")
 
-    # Total elapsed
-    seen = [st for st in stages if st.ts is not None and st.number not in ("✗",)]
+    seen = [s for s in stages if s.ts is not None and s.number != "X"]
     if len(seen) >= 2:
         total_s = (seen[-1].ts - seen[0].ts).total_seconds()
         m, s = divmod(int(total_s), 60)
-        lines.append(f"  Total elapsed: {m}m {s:02d}s   ({seen[0].number} → {seen[-1].number})")
+        lines.append(f"  Total elapsed: {m}m {s:02d}s   ({seen[0].tag} -> {seen[-1].tag})")
 
-    lines.append(sep)
+    lines.append(SEP)
     return "\n".join(lines)
 
 
-# ── append to logs/workflow.logs ─────────────────────────────────────────────
+# ── streaming live helpers ────────────────────────────────────────────────────
 
-def append_to_log(content: str) -> None:
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as fh:
-        fh.write("\n")
-        fh.write(content)
-        fh.write("\n")
-
-
-# ── ANSI clear-line helper for --live redraw ─────────────────────────────────
-
-def _clear_screen():
-    # Move cursor to top-left and clear the screen (works in most terminals)
-    print("\033[H\033[J", end="", flush=True)
+def _stream_stage_line(st: Stage, origin: datetime, utc_only: bool) -> str:
+    """Return a single terminal line for one newly-seen stage."""
+    ts_short = _fmt_ts_short(st.ts) if not utc_only else st.ts.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+    delta    = _fmt_delta((st.ts - origin).total_seconds())
+    line     = f"  [{ts_short}  {delta}]  {st.tag} {st.label}"
+    if st.detail:
+        first_detail = st.detail.split("\n")[0].strip()
+        if first_detail:
+            line += f"\n               {first_detail}"
+    return line
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -698,114 +560,160 @@ def main():
     mode_group.add_argument("--one-shot", action="store_true", default=True,
                             help="Query once, print, append to logs/workflow.logs, exit (default)")
     mode_group.add_argument("--live", action="store_true",
-                            help="Re-query every INTERVAL seconds; exit when stage ⑨ is seen or Ctrl-C")
+                            help="Stream new events as they appear; exit on stage [9] or idle timeout")
     parser.add_argument("--interval", type=int, default=5, metavar="SEC",
-                        help="Re-poll interval for --live mode (default: 5 s)")
+                        help="Poll interval for --live mode (default: 5 s)")
+    parser.add_argument("--idle-timeout", type=int, default=300, metavar="SEC",
+                        help="Seconds of no new events after stage [7] before auto-exit (default: 300)")
     parser.add_argument("--utc-only", action="store_true",
                         help="Show UTC timestamps only (default: CEST primary + UTC secondary)")
     parser.add_argument("--no-heyex", action="store_true",
                         help="Skip SSM queries to heyex2 (faster, backend-only view)")
     args = parser.parse_args()
 
-    # --live sets one-shot=False
     if args.live:
         args.one_shot = False
 
-    # ── resolve job_id ───────────────────────────────────────────────────────
+    # ── resolve job_id ────────────────────────────────────────────────────────
     job_id = args.job_id.strip() if args.job_id else None
 
     if job_id is None and not args.live:
-        # One-shot auto-detect: pick the newest job already in S3
         result = discover_job_id()
         if result is None:
-            print("  ✗ No jobs found in s3://appway-bridge-prod/incoming/ — nothing to show.", file=sys.stderr)
+            print(f"  [X] No jobs found in s3://{S3_BUCKET}/incoming/ — nothing to show.", file=sys.stderr)
             sys.exit(1)
         job_id, ts = result
         print(f"  Auto-detected job: {job_id}  (uploaded {_fmt_ts(ts)})")
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-    def _run_once(jid: str) -> tuple[str, bool]:
-        """Query, render, return (rendered_text, stage9_seen)."""
-        stages = build_timeline(jid)
-        text = render_timeline(jid, stages, utc_only=args.utc_only)
-        stage9_seen = any(
-            st.number == "⑨" and st.ts is not None for st in stages
-        )
-        return text, stage9_seen
-
+    # ── one-shot ──────────────────────────────────────────────────────────────
     if not args.live:
-        # ── one-shot ─────────────────────────────────────────────────────────
-        text, _ = _run_once(job_id)
+        stages = build_timeline(job_id)
+        text   = render_timeline(job_id, stages, utc_only=args.utc_only)
         print(text)
-        append_to_log(text)
-        print(f"\n  ↳ Appended to {LOG_FILE}")
-    else:
-        # ── live mode ────────────────────────────────────────────────────────
-        if job_id:
-            # Explicit job_id supplied — go straight to timeline view
-            print(f"  Live mode — polling every {args.interval}s  (Ctrl-C to stop)")
-            iteration = 0
-            text = ""
-            try:
-                while True:
-                    iteration += 1
-                    text, done = _run_once(job_id)
-                    _clear_screen()
-                    print(text)
-                    print(f"\n  [live]  iteration #{iteration}  |  next refresh in {args.interval}s  |  Ctrl-C to stop")
-                    if done:
-                        append_to_log(text)
-                        print(f"\n  ✓ Stage ⑨ seen — job complete. Appended to {LOG_FILE}")
-                        break
-                    time.sleep(args.interval)
-            except KeyboardInterrupt:
-                print("\n  Stopped by user.")
-                if text:
-                    append_to_log(text)
-                    print(f"  ↳ Last snapshot appended to {LOG_FILE}")
-        else:
-            # Auto-detect mode — first wait for a NEW job to appear, then watch it
-            script_start = datetime.now(timezone.utc)
-            bucket_url   = f"s3://{S3_BUCKET}/incoming/"
-            print(f"  Live mode — waiting for a new job to appear in {bucket_url}")
-            print(f"  (started at {_fmt_ts(script_start)} · polling every {args.interval}s · Ctrl-C to stop)")
+        _log_write(text)
+        print(f"\n  -> Appended to {LOG_FILE}")
+        return
 
-            # Phase 1: wait for a brand-new upload
-            wait_iter = 0
-            text = ""
-            try:
-                while True:
-                    wait_iter += 1
-                    found = discover_job_id(since=script_start)
-                    if found:
-                        job_id, ts = found
-                        _clear_screen()
-                        print(f"  ✓ New job detected: {job_id}  (uploaded {_fmt_ts(ts)})")
-                        print(f"  → switching to timeline view  (polling every {args.interval}s)\n")
-                        break
-                    elapsed = int((datetime.now(timezone.utc) - script_start).total_seconds())
-                    print(f"\r  ⏳  no new job yet  ({elapsed}s elapsed) …", end="", flush=True)
-                    time.sleep(args.interval)
+    # ── live mode ─────────────────────────────────────────────────────────────
+    #
+    # Phase 1 (auto-detect only): wait for a brand-new job in S3.
+    # Phase 2: stream new events as single lines; never re-render past output.
+    #          Write each new line to logs/workflow.logs immediately.
+    #          Exit when stage [9] is seen, or after idle_timeout seconds with
+    #          no new events following stage [7].
 
-                # Phase 2: live timeline for the discovered job
-                iteration = 0
-                while True:
-                    iteration += 1
-                    text, done = _run_once(job_id)
-                    _clear_screen()
-                    print(text)
-                    print(f"\n  [live]  iteration #{iteration}  |  next refresh in {args.interval}s  |  Ctrl-C to stop")
-                    if done:
-                        append_to_log(text)
-                        print(f"\n  ✓ Stage ⑨ seen — job complete. Appended to {LOG_FILE}")
-                        break
-                    time.sleep(args.interval)
+    if job_id is None:
+        # ── phase 1: wait for new job ────────────────────────────────────────
+        script_start = datetime.now(timezone.utc)
+        print(f"  Live mode — waiting for a new job in s3://{S3_BUCKET}/incoming/")
+        print(f"  (started at {_fmt_ts(script_start)} · poll every {args.interval}s · Ctrl-C to stop)")
+        try:
+            while True:
+                found = discover_job_id(since=script_start)
+                if found:
+                    job_id, ts = found
+                    # clear the waiting line
+                    print(f"\r  New job: {job_id}  (uploaded {_fmt_ts(ts)})" + " " * 10)
+                    break
+                elapsed = int((datetime.now(timezone.utc) - script_start).total_seconds())
+                print(f"\r  Waiting...  {elapsed}s elapsed", end="", flush=True)
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\n  Stopped by user (no job seen).")
+            return
 
-            except KeyboardInterrupt:
-                print("\n  Stopped by user.")
-                if text:
-                    append_to_log(text)
-                    print(f"  ↳ Last snapshot appended to {LOG_FILE}")
+    # ── phase 2: streaming timeline ──────────────────────────────────────────
+    header = (
+        f"\n{SEP}\n"
+        f"  AppWay job:  {job_id}\n"
+        f"  Watching at: {_fmt_ts(datetime.now(timezone.utc))}\n"
+        f"{SEP}"
+    )
+    print(header)
+    _log_write(header)
+
+    seen_numbers: set[str] = set()   # stage numbers already printed
+    origin: Optional[datetime] = None
+    last_new_event_time = time.monotonic()
+    stage7_seen = False
+
+    try:
+        while True:
+            stages = build_timeline(job_id)
+
+            # collect newly-resolved stages
+            new_stages = [
+                s for s in stages
+                if s.ts is not None and s.number not in seen_numbers
+            ]
+            # sort new stages by their actual timestamp
+            new_stages.sort(key=lambda s: s.ts)
+
+            for st in new_stages:
+                if origin is None:
+                    origin = st.ts
+                line = _stream_stage_line(st, origin, args.utc_only)
+                print(line)
+                _log_write(line)
+                seen_numbers.add(st.number)
+                last_new_event_time = time.monotonic()
+                if st.number == "7":
+                    stage7_seen = True
+
+            # exit conditions
+            if "9" in seen_numbers:
+                summary = _build_summary(stages, seen_numbers)
+                print(summary)
+                _log_write(summary)
+                footer = f"  -> Appended to {LOG_FILE}"
+                print(footer)
+                _log_write(SEP)
+                break
+
+            if stage7_seen:
+                idle = time.monotonic() - last_new_event_time
+                remaining = int(args.idle_timeout - idle)
+                if idle >= args.idle_timeout:
+                    msg = f"\n  (!) Idle timeout reached — stage [9] not detected; exiting."
+                    print(msg)
+                    _log_write(msg)
+                    summary = _build_summary(stages, seen_numbers)
+                    print(summary)
+                    _log_write(summary)
+                    _log_write(SEP)
+                    break
+                # show countdown on a single overwriting line
+                print(f"\r  Waiting for stage [9]...  idle timeout in {remaining}s", end="", flush=True)
+
+            time.sleep(args.interval)
+
+    except KeyboardInterrupt:
+        print("\n  Stopped by user.")
+        summary = _build_summary(build_timeline(job_id), seen_numbers)
+        print(summary)
+        _log_write(summary)
+        _log_write(SEP)
+
+
+def _build_summary(stages: list[Stage], seen_numbers: set[str]) -> str:
+    all_tags  = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    seen_tags = [Stage._TAG.get(n, f"[{n}]") for n in all_tags if n in seen_numbers]
+    miss_tags = [Stage._TAG.get(n, f"[{n}]") for n in all_tags if n not in seen_numbers]
+    seen_st   = [s for s in stages if s.ts is not None and s.number not in ("X",)]
+    elapsed   = ""
+    if len(seen_st) >= 2:
+        total_s = (seen_st[-1].ts - seen_st[0].ts).total_seconds()
+        m, s = divmod(int(total_s), 60)
+        elapsed = f"  Total elapsed:  {m}m {s:02d}s   ({seen_st[0].tag} -> {seen_st[-1].tag})\n"
+    seen_str = " ".join(seen_tags) if seen_tags else "(none)"
+    miss_str = " ".join(miss_tags) if miss_tags else "(none)"
+    return (
+        f"\n  Summary\n"
+        f"  -------\n"
+        f"  Stages seen   : {seen_str}\n"
+        f"  Stages missed : {miss_str}\n"
+        f"{elapsed}"
+    )
 
 
 if __name__ == "__main__":
