@@ -8,16 +8,16 @@ back in HEYEX — and appends it to  logs/workflow.logs.
 
 Stages covered
 ──────────────
-  [1]  DICOM received by AppWay Link               heyex2 AppWay Link log
-  [2]  DICOM uploaded to S3 incoming/              S3 object LastModified
-  [3]  Job message enqueued on SQS appway-jobs     (derived: ~= stage [2])
-  [4]  Input downloaded by backend                 /var/log/appway-worker.log
-  [5]  Backend processes (YOLO + ePDF)             /var/log/appway-worker.log
-  [6]  Result uploaded to S3 results/              S3 object LastModified
-  [7]  Result message enqueued on appway-results   /var/log/appway-worker.log
-  [8]  Result downloaded by AppWay Link            heyex2 AshvinsDistribution dir
-  [9]  Result stored into HEYEX                    heyex2 MCAshvinsWorkstation log
-  [X]  (if present) user-click failure             heyex2 MCAshvinsWorkstation log
+   [1]  DICOM received by AppWay Link               heyex2 AshvinsDistribution .zip
+   [2]  DICOM uploaded to S3 incoming/              S3 object LastModified
+   [3]  Job message enqueued on SQS appway-jobs     (derived: ~= stage [2])
+   [4]  Input downloaded by backend                 /var/log/appway-worker.log
+   [5]  Backend processes (YOLO + ePDF)             /var/log/appway-worker.log
+   [6]  Result uploaded to S3 results/              S3 object LastModified
+   [7]  Result message enqueued on appway-results   /var/log/appway-worker.log
+   [8]  Result stored by AppWay Link                heyex2 AshvinsDistribution .dcm
+   [9]  Result stored into HEYEX                    heyex2 UVOBackup UVOJob-*-DeleteImage-Done
+   [X]  (if present) user-click failure             heyex2 MCAshvinsWorkstation log
 
 Usage
 ─────
@@ -287,10 +287,10 @@ _HEYEX_LOG_DIR  = r"C:\HEYEX\logfiles"
 _APPWAY_LOG_DIR = r"C:\HEYEX\AshvinsDistribution"
 _UVOB_DIR       = r"C:\HEYEX\ImagwPool\UVOBackup"
 _HEYEX_TS_RE    = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)")
-# Folder name timestamp embedded in AIResultBackup entries:
+# Folder name timestamp embedded in UVOBackup entries:
+# e.g. E0ee1bc04-dd6f_Qf73528ea-2026.05.18-11.11.31.183-UVOJob-19-DeleteImage-Done
 # e.g. K1b9b9cf6-ac92_Gcda68a17_2026.05.18-11.11.24.589-AIResultBackup-<uuid>
-# The timestamp comes BEFORE "AIResultBackup" in the name.
-_AIBACKUP_TS_RE = re.compile(r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})\.\d+-AIResultBackup")
+_FOLDER_TS_RE   = re.compile(r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})\.\d+-")
 
 
 def _parse_heyex_ts(ts_str: str) -> Optional[datetime]:
@@ -314,23 +314,41 @@ def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
     r"""
     Query heyex2 via SSM for stage markers.
 
-    Stage sources (confirmed):
-      [1]  AshvinsDistribution\ -- newest .zip file with ts >= job_origin_ts
-           (AppWay Link exports the DICOM as a zip before S3 upload)
-      [8]  AshvinsDistribution\ -- newest .rtc.dcm file with ts >= job_origin_ts
-           (AppWay Link stores result after downloading from S3)
-      [9]  ImagwPool\UVOBackup\ -- newest AIResultBackup-* folder with ts >= job_origin_ts
-           (HEYEX writes a backup marker when it stores the AI result)
-      [X]  MCAshvinsWorkstation.verbose.log -- "couldn't open file" with ts >= job_origin_ts
+    Stage sources (confirmed by SSM probes 2026-05-18):
+
+      [1]  AshvinsDistribution\ -- most-recent .zip whose LastWriteTime is in
+           window [job_origin_ts − 90 s, job_origin_ts + 60 s].
+           AppWay Link creates the zip BEFORE pushing to S3/SQS, so it arrives
+           ~30 s before the SQS message that defines job_origin_ts.
+
+      [8]  AshvinsDistribution\ -- most-recent .dcm file (NOT the input zip)
+           with LastWriteTime >= job_origin_ts and size < 100 KB.
+           AppWay Link writes the AI result here as a small .dcm (no ".rtc."
+           infix — confirmed on real traffic).
+
+      [9]  ImagwPool\UVOBackup\ -- a "…-UVOJob-N-DeleteImage-Done" folder
+           whose folder-name timestamp >= job_origin_ts.
+           HEYEX creates an AIResultBackup-<uuid> folder when it *starts*
+           importing, then creates UVOJob-N-DeleteImage-Done when it *finishes*.
+           We fire [9] only on the Done folder.
+
+      [X]  MCAshvinsWorkstation.verbose.log -- "couldn't open file" entries
+           with ts >= job_origin_ts (user-click WebView2 failure).
     """
     found: dict = {}
 
+    # Window for [1]: allow the .zip to arrive up to 90 s before the SQS
+    # job_origin_ts (AppWay zips the DICOM first, then uploads to S3, then
+    # enqueues to SQS — the zip can be 20-60 s earlier than the SQS event).
+    zip_earliest = (job_origin_ts - timedelta(seconds=90)) if job_origin_ts else None
+
     # ── [1] and [8] from AshvinsDistribution ─────────────────────────────────
+    # Fetch up to 30 most-recent entries so we don't miss anything.
     ps_appway = (
         r'$dir = "' + _APPWAY_LOG_DIR + r'"; '
         r'if (Test-Path $dir) { '
         r'  Get-ChildItem $dir -ErrorAction SilentlyContinue | '
-        r'  Sort-Object LastWriteTime -Descending | Select-Object -First 20 | '
+        r'  Sort-Object LastWriteTime -Descending | Select-Object -First 30 | '
         r'  Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize '
         r'} else { "DIR_NOT_FOUND" }'
     )
@@ -347,35 +365,58 @@ def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
             ts = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=CEST).astimezone(timezone.utc)
         except ValueError:
             continue
-        if job_origin_ts is not None and ts < job_origin_ts:
-            continue   # skip entries older than this job
 
-        if ".zip" in line.lower() and "appway_rcvd" not in found:
-            found["appway_rcvd"] = (ts, line.split()[0])   # stage [1]: AppWay received input
+        name_parts = line.split()
+        filename   = name_parts[0] if name_parts else ""
+        name_lower = filename.lower()
 
-        if ".rtc.dcm" in line.lower() and "result_downloaded" not in found:
-            found["result_downloaded"] = (ts, line.split()[0])   # stage [8]: result back to AppWay
+        # Try to extract the file size from Format-Table output
+        # Format-Table -AutoSize renders: Name   Length   LastWriteTime
+        # After splitting, Length is the second column when present
+        size_val: Optional[int] = None
+        for part in name_parts[1:]:
+            if part.isdigit():
+                size_val = int(part)
+                break
 
-    # ── [9] from UVOBackup AIResultBackup folders ─────────────────────────────
+        # [1]: .zip in the window [zip_earliest, job_origin_ts+60s]
+        if name_lower.endswith(".zip") and "appway_rcvd" not in found:
+            too_old = zip_earliest is not None and ts < zip_earliest
+            too_new = job_origin_ts is not None and ts > (job_origin_ts + timedelta(seconds=60))
+            if not too_old and not too_new:
+                found["appway_rcvd"] = (ts, filename)   # stage [1]
+
+        # [8]: .dcm (result) — must be AFTER job_origin_ts and small (<100 KB)
+        if name_lower.endswith(".dcm") and "result_downloaded" not in found:
+            if job_origin_ts is None or ts >= job_origin_ts:
+                # Exclude large input DICOMs (>100 KB); result is typically ~280-650 B
+                if size_val is None or size_val < 100_000:
+                    found["result_downloaded"] = (ts, filename)   # stage [8]
+
+    # ── [9] from UVOBackup DeleteImage-Done folders ───────────────────────────
+    # Fetch both AIResultBackup and UVOJob-*-Done folders so we can understand
+    # the sequence. We only fire [9] on a DeleteImage-Done folder.
     ps_uvo = (
         r'$dir = "' + _UVOB_DIR + r'"; '
         r'if (Test-Path $dir) { '
         r'  Get-ChildItem $dir -ErrorAction SilentlyContinue | '
-        r'  Where-Object { $_.Name -like "*AIResultBackup*" } | '
-        r'  Sort-Object LastWriteTime -Descending | Select-Object -First 10 | '
-        r'  Select-Object Name, LastWriteTime | Format-Table -AutoSize -Wrap '
+        r'  Where-Object { $_.Name -like "*AIResultBackup*" -or $_.Name -like "*DeleteImage-Done*" } | '
+        r'  Sort-Object CreationTime -Descending | Select-Object -First 20 | '
+        r'  Select-Object Name, CreationTime | Format-Table -AutoSize -Wrap '
         r'} else { "DIR_NOT_FOUND" }'
     )
     uvo_out = ssm_run(HEYEX2_INSTANCE, ps_uvo)
 
+    # Collect all dated entries from the UVOBackup listing
+    _uvo_entries: list[tuple[datetime, str]] = []
     for line in uvo_out.splitlines():
         line = line.strip()
-        if "AIResultBackup" not in line:
+        if not line:
             continue
-        # Try to parse timestamp from folder name first (most accurate)
-        fn_m = _AIBACKUP_TS_RE.search(line)
-        ts = _parse_folder_ts(fn_m.group(1)) if fn_m else None
-        # Fall back to Format-Table LastWriteTime field
+        # Try folder-name embedded timestamp first (most accurate, CEST)
+        fn_m = _FOLDER_TS_RE.search(line)
+        ts   = _parse_folder_ts(fn_m.group(1)) if fn_m else None
+        # Fall back to Format-Table CreationTime column
         if ts is None:
             ts_m = re.search(r'(\d+/\d+/\d{4}\s+\d+:\d+:\d+\s+[AP]M)', line)
             if ts_m:
@@ -385,13 +426,22 @@ def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
                     pass
         if ts is None:
             continue
+        name_parts = line.split()
+        folder_name = name_parts[0] if name_parts else line[:120]
+        _uvo_entries.append((ts, folder_name))
+
+    # Sort ascending so we can find the first Done after job_origin_ts
+    _uvo_entries.sort(key=lambda x: x[0])
+
+    for ts, folder_name in _uvo_entries:
         if job_origin_ts is not None and ts < job_origin_ts:
             continue
-        if "result_stored" not in found:
-            # Extract just the AIResultBackup UUID part for the detail label
-            uuid_m = re.search(r"AIResultBackup-([0-9a-f-]{36})", line)
-            label = f"UVOBackup/…AIResultBackup-{uuid_m.group(1)}" if uuid_m else line[:80]
+        if "DeleteImage-Done" in folder_name and "result_stored" not in found:
+            # Extract the job-sequence number for the detail label
+            seq_m = re.search(r"UVOJob-(\d+)-DeleteImage-Done", folder_name)
+            label = f"UVOBackup/…UVOJob-{seq_m.group(1)}-DeleteImage-Done" if seq_m else folder_name[:80]
             found["result_stored"] = (ts, label, None)
+            break   # take the first one after job_origin_ts
 
     # ── [X] click errors from MCAshvinsWorkstation.verbose.log ────────────────
     ps_heyex = (
@@ -538,22 +588,22 @@ def build_timeline(job_id: str) -> list[Stage]:
         stages.append(Stage("1", "DICOM received by AppWay Link", None,
                             "(no .zip found in AshvinsDistribution)"))
 
-    # [8] AppWay stored result (.rtc.dcm in AshvinsDistribution)
+    # [8] AppWay stored result (.dcm in AshvinsDistribution, size < 100 KB)
     if "result_downloaded" in heyex_data:
         ts, filename = heyex_data["result_downloaded"]
         stages.append(Stage("8", "Result stored by AppWay Link", ts,
                             f"AshvinsDistribution/{filename}"))
     else:
         stages.append(Stage("8", "Result stored by AppWay Link", None,
-                            "(no .rtc.dcm found in AshvinsDistribution)"))
+                            "(no result .dcm found in AshvinsDistribution yet)"))
 
-    # [9] HEYEX stored AI result (AIResultBackup folder in UVOBackup)
+    # [9] HEYEX finished storing AI result (UVOJob-*-DeleteImage-Done in UVOBackup)
     if "result_stored" in heyex_data:
         ts, label, _ = heyex_data["result_stored"]
         stages.append(Stage("9", "Result stored in HEYEX", ts, label))
     else:
         stages.append(Stage("9", "Result stored in HEYEX", None,
-                            "(no AIResultBackup entry found in UVOBackup)"))
+                            "(no UVOJob-*-DeleteImage-Done found in UVOBackup yet)"))
 
     if "click_error" in heyex_data:
         ts, bad_path, msg = heyex_data["click_error"]
@@ -766,9 +816,15 @@ def main():
                 if origin is None:
                     origin = st.ts
                     # print header row once, before the first data row
+                    # If the countdown line is active, clear it first
+                    if stage6_seen:
+                        print("\r\033[K", end="", flush=True)
                     hdr = _stream_header(args.utc_only)
                     print(hdr)
                     _log_write(hdr)
+                # Clear any active \r countdown line before printing a new event
+                if stage6_seen:
+                    print("\r\033[K", end="", flush=True)
                 line = _stream_stage_line(st, origin, args.utc_only)
                 print(line)
                 _log_write(line)

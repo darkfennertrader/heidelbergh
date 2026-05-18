@@ -166,18 +166,18 @@ as it is detected.
 
 ### Stages covered
 
-| Tag | Stage | Data source |
-|---|---|---|
-| `[1]` | DICOM received by AppWay Link (heyex2) | `AshvinsDistribution\` dir timestamps |
-| `[2]` | DICOM uploaded to S3 `incoming/` | S3 `LastModified` |
-| `[3]` | Job enqueued on SQS appway-jobs | (derived ≈ stage `[2]`) |
-| `[4]` | Input downloaded by backend | `/var/log/appway-worker.log` |
-| `[5]` | Backend processes (YOLO + ePDF) | `/var/log/appway-worker.log` |
-| `[6]` | ePDF result uploaded to S3 `results/` | `/var/log/appway-worker.log` + S3 |
-| `[7]` | Result enqueued on SQS appway-results | `/var/log/appway-worker.log` |
-| `[8]` | Result downloaded by AppWay Link | `AshvinsDistribution\` dir (`.zip` file) |
-| `[9]` | Result stored into HEYEX | SSM → `MCAshvinsWorkstation.verbose.log` |
-| `[X]` | User-click failure (if any) | SSM → `MCAshvinsWorkstation.verbose.log` |
+| Tag | Stage | Data source | Notes |
+|---|---|---|---|
+| `[1]` | DICOM received by AppWay Link | `AshvinsDistribution\` — `.zip` file | AppWay zips before S3 upload, so this is ~30 s **before** stage `[2]` |
+| `[2]` | DICOM uploaded to S3 `incoming/` | S3 `LastModified` | |
+| `[3]` | Job enqueued on SQS appway-jobs | (derived ≈ stage `[2]`) | |
+| `[4]` | Input downloaded by backend | `/var/log/appway-worker.log` | |
+| `[5]` | Backend processes (YOLO + ePDF) | `/var/log/appway-worker.log` | |
+| `[6]` | ePDF result uploaded to S3 `results/` | `/var/log/appway-worker.log` + S3 | |
+| `[7]` | Result enqueued on SQS appway-results | `/var/log/appway-worker.log` | |
+| `[8]` | Result stored by AppWay Link | `AshvinsDistribution\` — small `.dcm` file (<100 KB) | Result file, **not** `.rtc.dcm` — confirmed on live traffic |
+| `[9]` | Result stored into HEYEX (import done) | `UVOBackup\…-UVOJob-N-DeleteImage-Done` folder | HEYEX creates `AIResultBackup-*` when import *starts*, then `UVOJob-N-DeleteImage-Done` when import *finishes* — we fire on the Done folder |
+| `[X]` | User-click failure (if any) | SSM → `MCAshvinsWorkstation.verbose.log` | WebView2 "can't reach this page" error |
 
 ### Usage
 
@@ -204,26 +204,26 @@ The script prints:
 
   TIME (CEST)    ELAPSED    ST   STAGE
   ─────────────  ─────────  ───  ──────────────────────────────────────────
-  10:01:46 CEST  +00:00:00  [8]  Result downloaded by AppWay Link
-                                 20260518100146.jdtwh0b3.yz5.zip  (399 KB)
-  10:02:16 CEST  +00:00:30  [2]  DICOM uploaded to S3
+  11:32:38 CEST  +00:00:00  [1]  DICOM received by AppWay Link
+                                 AshvinsDistribution/20260518113237.gxtdcyx5.igb.zip
+  11:33:08 CEST  +00:00:30  [2]  DICOM uploaded to S3
                                  s3://appway-bridge-prod/incoming/…/….dcm  (457 KB)
-  10:02:16 CEST  +00:00:30  [4]  Input downloaded by backend
+  11:33:08 CEST  +00:00:30  [4]  Input downloaded by backend
                                  s3://appway-bridge-prod/incoming/…/  (1 file(s))
-  10:02:18 CEST  +00:00:32  [5]  Backend processes (YOLO + ePDF)
-                                 Inference result: verdict=Negative, processing_time=1.28s
-  10:02:18 CEST  +00:00:32  [7]  Result enqueued on SQS appway-results
-  10:02:19 CEST  +00:00:33  [6]  ePDF result uploaded to S3
-  Waiting for stage [9]...  idle timeout in 9m 53s
-  ...
-  10:09:45 CEST  +00:07:59  [9]  Result stored in HEYEX
-                                 AshvinsDistribution/20260518100945.ya2uxkph.rtc.dcm
+  11:33:08 CEST  +00:00:30  [5]  Backend processes (YOLO + ePDF)
+  11:33:11 CEST  +00:00:33  [7]  Result enqueued on SQS appway-results
+  11:33:12 CEST  +00:00:34  [6]  ePDF result uploaded to S3
+  Waiting for stage [9]...  idle timeout in 4m 59s
+  11:34:51 CEST  +00:02:13  [8]  Result stored by AppWay Link
+                                 AshvinsDistribution/20260518113451.vukbypme.n0b.dcm
+  11:35:05 CEST  +00:02:27  [9]  Result stored in HEYEX
+                                 UVOBackup/…UVOJob-20-DeleteImage-Done
 
   Summary
   -------
-  Stages seen   : [2] [4] [5] [6] [7] [8] [9]
-  Stages missed : [1] [3]
-  Total elapsed:  7m 59s   ([8] -> [9])
+  Stages seen   : [1] [2] [4] [5] [6] [7] [8] [9]
+  Stages missed : [3]
+  Total elapsed:  2m 27s   ([1] -> [9])
 ```
 
 #### One-shot (auto-detect newest job already in S3)
