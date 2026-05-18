@@ -295,24 +295,33 @@ format as `docs/appway.md`.
 
 **Symptom:** After a successful AppWay job the result tile appears in HEYEX, but clicking
 it shows the WebView2 error *"Hmm, can't reach this page"*. The log
-`C:\HEYEX\LogFiles\MCAshvinsWorkstation.verbose.log` contains:
+`C:\HEYEX\logfiles\MCAshvinsWorkstation.verbose.log` contains:
 
 ```
-MiiiDcmFile constructor error, couldn't open file
-  \\ec2amaz-uim0t5t\ImagwPool\MC1\3\11\<N>\<timestamp>.<rand>.dcm
+MiiiDcmFile  constructor  error, couldn't open file
+  \\ec2amaz-uim0t5t\ImagwPool\MC1\3\<series>\<slot>\<timestamp>.<rand>.dcm
   for reading
   error, message was: The system cannot find the path specified
   at MC.StudyManager.Documents.MCFDocumentsPanel.ThreadLoadDICOMReport
 ```
 
-**Root cause:** HEYEX holds an in-memory path record (cached by `MCAshvinsWorkstation`)
-that points to a slot (`\<N>\`) that no longer exists — either the input DICOM was moved
-to `UVOBackup\…\DeleteImage-Done\` or the path was stale from before the AppWay Link
-wrote the result into a different slot. The SQL Anywhere DB (`dbsrv17`) and the
-workstation process get out of sync after long uptime sessions.
+**Root cause (confirmed 2026-05-18):** HEYEX stores the result DCM via AppWay Link and
+records the path using the **UNC hostname** `\\ec2amaz-uim0t5t\ImagwPool\…`. When the
+user clicks the tile, `MCAshvinsWorkstation` resolves that UNC path via the Windows
+network stack. On this EC2 instance the Windows Computer Browser / NetBIOS name resolution
+is intermittently unresolvable for `ec2amaz-uim0t5t` — the hostname resolves to itself
+via `C:\Windows\System32\drivers\etc\hosts` (`127.0.0.1`) but the UNC share
+`\\ec2amaz-uim0t5t\ImagwPool` is not always exported as a reachable SMB share.
 
-**The result file itself is fine** — it was written correctly to disk by AppWay Link.
-Only the pointer HEYEX uses to open it on click is wrong.
+The **result PDF and DICOM are structurally correct** (verified: valid PDF-1.4, 2 pages,
+`application/pdf` MIME tag, all AppWay credential private tags intact). The error is
+purely at the file-access layer, not the content layer.
+
+**Timeline of a failing job (from `job_timeline.py` output, 2026-05-18):**
+```
+⑨  07:45:23 CEST  Result stored in HEYEX (AshvinsDistribution RTC)
+✗  07:47:41 CEST  User-click failure — UNC path could not be read (2m 18s later)
+```
 
 **Fix — try in order (fastest → most disruptive):**
 
@@ -362,13 +371,22 @@ Only the pointer HEYEX uses to open it on click is wrong.
      --query 'InstanceInformationList[0].PingStatus' --output text
    ```
 
-**Confirmed occurrence:** 2026-05-17/18 — job `final-5f1e35fa-3397-4604-b5c1-a7785919ea13`.
-Result (`\MC1\3\11\30\…q11rqjd2.gfp.dcm`, 325 KB) was stored correctly on disk.
-After reboot the tile opened without error. ✓
+**Confirmed occurrences:**
+- 2026-05-17 — job `final-5f1e35fa-…`: after an EC2 reboot the tile opened correctly ✓
+- 2026-05-18 — job `final-dbc64b14-…`: error recurred on the very first job post-reboot,
+  disproving the "stale uptime cache" hypothesis. Root cause confirmed as UNC resolution.
 
-> **Note to Heidelberg:** We asked Rouven (2026-05-18) whether there is an official
-> cache-flush API or HEYEX CLI command shorter than a full service restart. Will update
-> this section once we hear back.
+**Permanent fix candidates (to investigate with Heidelberg):**
+
+- Configure HEYEX to reference the local path `C:\HEYEX\ImagwPool\…` instead of the UNC
+  path `\\ec2amaz-uim0t5t\ImagwPool\…`. This is likely a registry or `dbSrvCfg.txt`
+  setting.
+- Add `ec2amaz-uim0t5t` → `127.0.0.1` to `C:\Windows\System32\drivers\etc\hosts` AND
+  share `C:\HEYEX\ImagwPool` as `ImagwPool` so the UNC path resolves correctly.
+
+> **Note to Heidelberg:** We asked Rouven (2026-05-18) whether HEYEX can be configured
+> to use a local path instead of UNC for ImagwPool access, and whether there is an official
+> cache-flush API shorter than a full reboot. Will update once we hear back.
 
 ---
 

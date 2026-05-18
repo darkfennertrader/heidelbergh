@@ -21,7 +21,7 @@
 #   3. Stacks them as a single multi-frame DICOM (uncompressed, Explicit VR
 #      Little Endian, NumberOfFrames = N)
 #   4. Copies DICOM-level metadata + the credential block from a hardcoded
-#      reference DICOM (docs/examples/20220509185826_d7a99bf81ff94ecd820bd72f37e11cfc.dcm)
+#      reference DICOM (docs/gold_samples/20220509185826_d7a99bf81ff94ecd820bd72f37e11cfc.dcm)
 #   5. Stores the original input filenames inside the DICOM so they survive
 #      the round-trip (ImageComments tag + appended to SeriesDescription).
 #   6. Assigns fresh StudyInstanceUID / SeriesInstanceUID / SOPInstanceUID
@@ -32,7 +32,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults
 # ─────────────────────────────────────────────────────────────────────────────
-REFERENCE_DCM="${REFERENCE_DCM:-/home/ubuntu/appway-backend/docs/examples/20220509185826_d7a99bf81ff94ecd820bd72f37e11cfc.dcm}"
+REFERENCE_DCM="${REFERENCE_DCM:-/home/ubuntu/appway-backend/docs/gold_samples/20220509185826_d7a99bf81ff94ecd820bd72f37e11cfc.dcm}"
 VENV_PY="${VENV_PY:-/home/ubuntu/appway-backend/.venv/bin/python3}"
 
 INPUT_DIR=""

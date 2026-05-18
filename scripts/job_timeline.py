@@ -215,87 +215,79 @@ def ssm_run(instance_id: str, command: str, timeout: int = SSM_TIMEOUT) -> str:
     return "[SSM timed out]"
 
 
-# ── backend journal grep ─────────────────────────────────────────────────────
+# ── backend log grep ─────────────────────────────────────────────────────────
+#
+# The worker is configured with:
+#   StandardOutput=append:/var/log/appway-worker.log
+# Log line format:
+#   2026-05-18T05:37:24 [INFO] appway_backend.worker: [job_id] message
+# Timestamps are UTC (no tz suffix).
+
+_WORKER_LOG = Path("/var/log/appway-worker.log")
+
+# Local log line regex:  "2026-05-18T05:37:24 [INFO] module: msg"
+_WORKER_LOG_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s+\[(?:INFO|WARNING|ERROR|DEBUG)\]\s+\S+:\s+(.*)"
+)
+
 
 def journal_grep(job_id: str) -> list[tuple[datetime, str]]:
     """
-    Pull appway-worker journal lines that contain job_id.
-    Returns list of (utc_datetime, rest_of_line) sorted by time.
+    Pull appway-worker log lines that contain job_id.
+    Returns list of (utc_datetime, message) sorted by time.
 
-    Uses SSH / local journalctl.  If running ON the backend instance itself,
-    just calls journalctl directly.  If running on the dev laptop, uses SSM.
+    Tries local /var/log/appway-worker.log first.
+    Falls back to SSM grep on BACKEND_INSTANCE if not available locally.
     """
-    # Try local journalctl first (works when we ARE the backend EC2)
-    lines = _local_journal_grep(job_id)
+    lines = _local_worker_log_grep(job_id)
     if lines is None:
-        # Fall back to SSM
-        lines = _ssm_journal_grep(job_id)
+        lines = _ssm_worker_log_grep(job_id)
     return lines
 
 
-def _local_journal_grep(job_id: str) -> Optional[list[tuple[datetime, str]]]:
-    """
-    Try `journalctl -u appway-worker --no-pager -o short-iso` locally.
-    Returns None if the unit doesn't exist here (i.e. we're not the backend).
-    """
+def _local_worker_log_grep(job_id: str) -> Optional[list[tuple[datetime, str]]]:
+    """Read /var/log/appway-worker.log locally if it exists."""
+    if not _WORKER_LOG.exists():
+        return None
     try:
-        result = subprocess.run(
-            [
-                "journalctl", "-u", "appway-worker",
-                "--no-pager", "-o", "short-iso",
-                "--grep", re.escape(job_id),
-            ],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0 and "No entries" not in result.stderr:
-            # Unit not found / journalctl not available → not the backend host
-            if "not found" in result.stderr.lower() or "not exist" in result.stderr.lower():
-                return None
-        return _parse_journal_lines(result.stdout, job_id)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        raw = _WORKER_LOG.read_text(errors="replace")
+        return _parse_worker_log_lines(raw, job_id)
+    except Exception:
         return None
 
 
-def _ssm_journal_grep(job_id: str) -> list[tuple[datetime, str]]:
-    """Grep the backend journal via SSM (Linux)."""
-    cmd = (
-        f"journalctl -u appway-worker --no-pager -o short-iso 2>/dev/null"
-        f" | grep -F '{job_id}' | tail -200"
-    )
-    raw = ssm_run(BACKEND_INSTANCE, cmd)
+def _ssm_worker_log_grep(job_id: str) -> list[tuple[datetime, str]]:
+    """Grep the backend worker log via SSM (Linux)."""
+    cmd = f"grep -F '{job_id}' /var/log/appway-worker.log 2>/dev/null | tail -500"
+    raw = ssm_run(BACKEND_INSTANCE, cmd, timeout=60)
     if raw.startswith("[SSM"):
         return []
-    return _parse_journal_lines(raw, job_id)
+    return _parse_worker_log_lines(raw, job_id)
 
 
-# journal line format: "2026-05-17T22:50:09+0000 hostname appway-worker[pid]: MSG"
-_JOURNAL_TS_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})\s+\S+\s+\S+:\s+(.*)"
-)
-
-def _parse_journal_lines(raw: str, job_id: str) -> list[tuple[datetime, str]]:
+def _parse_worker_log_lines(raw: str, job_id: str) -> list[tuple[datetime, str]]:
     out = []
     for line in raw.splitlines():
         if job_id not in line:
             continue
-        m = _JOURNAL_TS_RE.match(line)
+        m = _WORKER_LOG_RE.match(line)
         if not m:
             continue
         ts_str, msg = m.group(1), m.group(2)
         try:
-            # Python 3.7+ strptime with %z parses "+0000" / "+0200"
-            dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S%z")
+            # Timestamps in the log are UTC (no tz suffix)
+            dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-        out.append((dt.astimezone(timezone.utc), msg))
+        out.append((dt, msg))
     out.sort(key=lambda x: x[0])
     return out
 
 
 # ── heyex2 log grep ──────────────────────────────────────────────────────────
 
-_HEYEX_LOG_DIR = r"C:\HEYEX\LogFiles"
-_APPWAY_LOG_DIR = r"C:\ProgramData\Heidelberg Engineering\AppWay Link\Logs"
+_HEYEX_LOG_DIR = r"C:\HEYEX\logfiles"   # note: lowercase on this instance
+_APPWAY_LOG_DIR = r"C:\HEYEX\AshvinsDistribution"   # AppWay/AI Marketplace drop dir
 
 _HEYEX_TS_RE = re.compile(
     r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)"  # "2026-05-17 23:02:02.229"
@@ -318,7 +310,7 @@ def _parse_heyex_ts(ts_str: str) -> Optional[datetime]:
     return None
 
 
-def _heyex_grep(job_id: str, result_filename: str) -> dict:
+def _heyex_grep(job_id: str, result_filename: str, job_origin_ts: Optional[datetime] = None) -> dict:
     """
     Grep heyex2 Windows logs via SSM PowerShell.
 
@@ -330,9 +322,16 @@ def _heyex_grep(job_id: str, result_filename: str) -> dict:
     found: dict = {}
 
     # ── MCAshvinsWorkstation.verbose.log — result stored + click error ──────
+    # The verbose.log has lines like:
+    #   2026-05-18 07:47:41.967  10756  166  MiiiDcmFile  constructor  error, couldn't open file \\host\ImagwPool\...
+    #   2026-05-18 07:47:41.978  10756  166  MCLogFile    LogException ...  prepare \\host\ImagwPool\...
+    # We target lines with "couldn't open file" (has timestamp + UNC path on same line)
+    # and lines with "ImagwPool" but NOT "couldn't" (= successful store).
     ps_heyex = (
-        r'$log = Get-ChildItem "' + _HEYEX_LOG_DIR + r'" -Filter "MCAshvinsWorkstation.verbose.log" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1; '
-        r'if ($log) { Get-Content $log.FullName | Select-String -Pattern "' + re.escape(result_filename) + r'|ThreadLoadDICOMReport|DeleteImage-Done" } else { "LOG_NOT_FOUND" }'
+        r'$log = "' + _HEYEX_LOG_DIR + r'\MCAshvinsWorkstation.verbose.log"; '
+        r'if (Test-Path $log) { '
+        r'  Get-Content $log | Select-String -Pattern "couldn''t open file|ImagwPool" | Select-Object -Last 40 '
+        r'} else { "LOG_NOT_FOUND" }'
     )
     heyex_out = ssm_run(HEYEX2_INSTANCE, ps_heyex)
 
@@ -340,42 +339,65 @@ def _heyex_grep(job_id: str, result_filename: str) -> dict:
         ts_m = _HEYEX_TS_RE.search(line)
         ts = _parse_heyex_ts(ts_m.group(1)) if ts_m else None
 
-        if result_filename and result_filename in line and "result_stored" not in found:
-            # Line mentions our result DCM → it was stored
-            path_m = re.search(r'(C:\\[^\s"]+\.dcm)', line, re.IGNORECASE)
-            path = path_m.group(1) if path_m else result_filename
-            # Try to get file size via SSM
-            size = _ssm_file_size(path)
-            found["result_stored"] = (ts, path, size)
+        path_m = re.search(r'(\\\\[^\s\t<>]+\.dcm|C:\\[^\s\t<>]+\.dcm)', line, re.IGNORECASE)
 
-        if "ThreadLoadDICOMReport" in line and "click_error" not in found:
-            # Could not open file
-            path_m = re.search(r'(\\\\[^\s"]+\.dcm|C:\\[^\s"]+\.dcm)', line, re.IGNORECASE)
+        # "couldn't open file" → WebView2 click error (has timestamp + UNC path)
+        # Only record errors within ±2h of the job to avoid stale entries from old jobs.
+        if "couldn't open file" in line.lower() or "could not read the dicom" in line.lower():
             bad_path = path_m.group(1) if path_m else "(unknown path)"
-            found["click_error"] = (ts, bad_path, line.strip())
+            if "click_error" not in found and ts is not None:
+                if job_origin_ts is None or abs((ts - job_origin_ts).total_seconds()) < 7200:
+                    found["click_error"] = (ts, bad_path, line.strip()[:200])
 
-    # ── AppWay Link log — DICOM received + result downloaded ────────────────
+        # ImagwPool without error → result was written/stored in HEYEX (has timestamp)
+        elif "ImagwPool" in line and ts is not None and "result_stored" not in found:
+            path = path_m.group(1) if path_m else "?"
+            found["result_stored"] = (ts, path, None)
+
+    # ── AshvinsDistribution dir — infer ① and ⑧ from file timestamps ───────
+    # AppWay Link drops the incoming ZIP and sends back a .rtc.dcm response.
+    # The ZIP arrival ≈ stage ⑧ (result downloaded), the .rtc.dcm ≈ stage ①
+    # For stage ①: match the incoming DICOM upload time (≈ S3 stage ② time)
+    # We infer from AshvinsDistribution file timestamps near our job time.
     ps_appway = (
-        r'$log = Get-ChildItem "' + _APPWAY_LOG_DIR + r'" -Filter "*.log" -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3; '
-        r'if ($log) { $log | Get-Content | Select-String -Pattern "' + re.escape(job_id) + r'" | Select-Object -Last 50 } else { "LOG_NOT_FOUND" }'
+        r'$dir = "' + _APPWAY_LOG_DIR + r'"; '
+        r'if (Test-Path $dir) { '
+        r'  Get-ChildItem $dir -ErrorAction SilentlyContinue | '
+        r'  Sort-Object LastWriteTime -Descending | Select-Object -First 10 | '
+        r'  Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize '
+        r'} else { "DIR_NOT_FOUND" }'
     )
     appway_out = ssm_run(HEYEX2_INSTANCE, ps_appway)
 
+    # Parse the table output to find ZIP file (= result downloaded by AppWay Link)
+    # Format: "Name   Length   LastWriteTime"
     for line in appway_out.splitlines():
-        ts_m = _HEYEX_TS_RE.search(line)
-        ts = _parse_heyex_ts(ts_m.group(1)) if ts_m else None
+        # Look for a .zip file (AppWay result delivery)
+        if ".zip" in line.lower() and "result_downloaded" not in found:
+            # Extract timestamp from Format-Table output: last column is date/time
+            ts_m = re.search(r'(\d+/\d+/\d{4}\s+\d+:\d+:\d+\s+[AP]M)', line)
+            if ts_m:
+                try:
+                    local_dt = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p")
+                    ts = local_dt.replace(tzinfo=CEST).astimezone(timezone.utc)
+                    found["result_downloaded"] = (ts, line.strip())
+                except ValueError:
+                    pass
 
-        low = line.lower()
-        # AppWay Link uploads: "upload", "sending", "put"
-        if any(kw in low for kw in ("upload", "put object", "sending")) and "dicom_received" not in found:
-            path_m = re.search(r'([A-Z]:\\[^\s"]+\.dcm)', line, re.IGNORECASE)
-            path = path_m.group(1) if path_m else "?"
-            found["dicom_received"] = (ts, path, None)
+        # Look for .rtc.dcm (AppWay Link confirmation sent back to HEYEX → ≈ stage ⑨)
+        if ".rtc.dcm" in line.lower() and "result_stored" not in found:
+            ts_m = re.search(r'(\d+/\d+/\d{4}\s+\d+:\d+:\d+\s+[AP]M)', line)
+            if ts_m:
+                try:
+                    local_dt = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p")
+                    ts = local_dt.replace(tzinfo=CEST).astimezone(timezone.utc)
+                    found["result_stored"] = (ts, f"AshvinsDistribution/{line.split()[0]}", None)
+                except ValueError:
+                    pass
 
-        # AppWay Link downloads result: "download", "get object", "result"
-        if any(kw in low for kw in ("download", "get object", "result")) and "result_downloaded" not in found:
-            if "result" in low:
-                found["result_downloaded"] = (ts, line.strip())
+    # Stage ① (DICOM received by AppWay Link): infer from incoming S3 time + small offset
+    # AppWay Link polls SQS, so ① ≈ ② + SQS polling delay (typically < 30s)
+    # We mark it as "inferred" if we can't find it in logs directly.
 
     return found
 
@@ -454,37 +476,48 @@ def build_timeline(job_id: str) -> list[Stage]:
                     return m.group(1)
         return None
 
-    dl_ts = _find_journal("STAGE 4/9 download_done")
-    dl_files = _find_journal_kv("STAGE 4/9 download_done", "files")
-    dl_bytes = _find_journal_kv("STAGE 4/9 download_done", "size_bytes")
-    dl_prefix = _find_journal_kv("STAGE 4/9 download_done", "s3_prefix")
-    dl_local  = _find_journal_kv("STAGE 4/9 download_done", "local_dir")
+    # ── Stage ④ — backend download ─────────────────────────────────────────
+    # Match: "Downloaded N file(s) from s3://…/incoming/job_id/" OR "Downloading input"
+    dl_ts = _find_journal("Downloaded") or _find_journal("Downloading input")
     dl_detail = ""
-    if dl_prefix:
-        n = dl_files or "?"
-        sz = _fmt_size(int(dl_bytes)) if dl_bytes else "?"
-        dl_detail = f"s3://{S3_BUCKET}/{dl_prefix}  →  {dl_local}  ({n} file(s), {sz})"
+    for _, msg in journal:
+        if "Downloaded" in msg and "incoming/" in msg:
+            # "Downloaded 1 file(s) from s3://bucket/incoming/job_id/"
+            m = re.search(r"Downloaded (\d+) file\(s\) from (s3://\S+)", msg)
+            if m:
+                dl_detail = f"{m.group(2)}  ({m.group(1)} file(s))"
+            break
     stages.append(Stage("④", "Input downloaded by backend", dl_ts, dl_detail))
 
-    proc_start = _find_journal("STAGE 5/9 processing_start")
-    proc_done  = _find_journal("STAGE 5/9 processing_done")
+    # ── Stage ⑤ — processing ───────────────────────────────────────────────
+    # Start: "Processing…"  Done: "Processor complete" or "Inference result"
+    proc_start = _find_journal("Processing\u2026") or _find_journal("Processing DICOM")
+    proc_done  = _find_journal("Processor complete") or _find_journal("ePDF DICOM saved")
     proc_detail = ""
     if proc_start and proc_done:
         elapsed = (proc_done - proc_start).total_seconds()
         proc_detail = f"duration {elapsed:.1f}s"
+    # Look for inference result detail
+    for _, msg in journal:
+        if "Inference result:" in msg:
+            proc_detail = msg.split("] ", 1)[-1] if "] " in msg else msg
+            break
     stages.append(Stage("⑤", "Backend processes (YOLO + ePDF)", proc_done or proc_start, proc_detail))
 
-    up_ts    = _find_journal("STAGE 6/9 upload_done")
-    up_key   = _find_journal_kv("STAGE 6/9 upload_done", "s3_key")
-    up_bytes = _find_journal_kv("STAGE 6/9 upload_done", "size_bytes")
+    # ── Stage ⑥ upload + ⑦ enqueue ────────────────────────────────────────
+    up_ts = _find_journal("Uploaded 1 file") or _find_journal("Uploading output")
     up_detail = ""
-    if up_key:
-        sz = _fmt_size(int(up_bytes)) if up_bytes else "?"
-        up_detail = f"s3://{S3_BUCKET}/{up_key}  ({sz})"
+    for _, msg in journal:
+        if "Uploaded" in msg and "results/" in msg:
+            m = re.search(r"Uploaded \d+ file\(s\) to (s3://\S+)", msg)
+            if m:
+                up_detail = f"{m.group(1)}"
+            break
+
     # Merge with S3 LastModified (S3 is authoritative for timing)
     if not up_ts and s3_result:
         up_ts = s3_result["last_modified"]
-    if up_ts and s3_result and not up_detail:
+    if s3_result and not up_detail:
         up_detail = f"s3://{S3_BUCKET}/{result_key}  ({_fmt_size(s3_result['size'])})"
     # Update stage ⑥ in place with journal detail if we got it
     for st in stages:
@@ -494,19 +527,23 @@ def build_timeline(job_id: str) -> list[Stage]:
             if up_ts and not st.ts:
                 st.ts = up_ts
 
-    enq_ts = _find_journal("STAGE 7/9 result_enqueued")
-    stages.append(Stage("⑦", "Result enqueued on SQS appway-results", enq_ts))
+    enq_ts = _find_journal("Sent result message")
+    enq_detail = ""
+    for _, msg in journal:
+        if "Sent result message" in msg:
+            enq_detail = msg.split("] ", 1)[-1] if "] " in msg else msg
+            break
+    stages.append(Stage("⑦", "Result enqueued on SQS appway-results", enq_ts, enq_detail))
 
     # ── SSM: heyex2 stages ①, ⑧, ⑨ ─────────────────────────────────────────
-    # Derive result filename from S3 key / journal
+    # result_fname: used to grep the HEYEX verbose.log for the stored DCM.
+    # AppWay Link names the stored file with a timestamp, not our job_id.
+    # We leave result_fname empty and rely on ImagwPool pattern matching.
     result_fname = ""
-    if up_key:
-        result_fname = up_key.split("/")[-1].replace(".dcm", "")  # e.g. "result"
-    # The actual filename on Windows is set by AppWay Link, not us.
-    # We'll use the job_id to grep for the record; and the result path
-    # from the verbose.log if found.
 
-    heyex_data = _heyex_grep(job_id, result_fname)
+    # Provide S3 incoming timestamp as the "job origin" for heyex time-window filtering
+    job_origin_ts = s3_incoming[0]["last_modified"] if s3_incoming else None
+    heyex_data = _heyex_grep(job_id, result_fname, job_origin_ts=job_origin_ts)
 
     # Stage ① — DICOM received
     if "dicom_received" in heyex_data:
