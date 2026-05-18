@@ -192,27 +192,32 @@ tail -f logs/workflow.logs
 ```
 
 The script prints:
+
 ```
   Live mode — waiting for a new job in s3://appway-bridge-prod/incoming/
-  (started at 2026-05-18 10:00:00 CEST · poll every 5s · Ctrl-C to stop)
+  (started at 2026-05-18 10:00:00 CEST  (08:00:00 UTC) · poll every 5s · Ctrl-C to stop)
   Waiting...  3s elapsed
-  New job: final-41707dc3-…  (uploaded 2026-05-18 10:01:46 CEST)
+  New job: final-41707dc3-…  (uploaded 2026-05-18 10:01:46 CEST  (08:01:46 UTC))
 
   AppWay job:  final-41707dc3-b8f7-4a9e-bbcc-9ee8738adecd
   Watching at: 2026-05-18 10:01:47 CEST  (08:01:47 UTC)
 
-  [10:01:46 CEST  +00:00:00]  [8] Result downloaded by AppWay Link
-               20260518100146.jdtwh0b3.yz5.zip  (399 KB)
-  [10:02:16 CEST  +00:00:30]  [2] DICOM uploaded to S3
-  [10:02:16 CEST  +00:00:30]  [4] Input downloaded by backend
-  [10:02:18 CEST  +00:00:32]  [5] Backend processes (YOLO + ePDF)
-               Inference result: verdict=Negative, processing_time=1.28s
-  [10:02:18 CEST  +00:00:32]  [7] Result enqueued on SQS appway-results
-  [10:02:19 CEST  +00:00:33]  [6] ePDF result uploaded to S3
-  Waiting for stage [9]...  idle timeout in 297s
+  TIME (CEST)    ELAPSED    ST   STAGE
+  ─────────────  ─────────  ───  ──────────────────────────────────────────
+  10:01:46 CEST  +00:00:00  [8]  Result downloaded by AppWay Link
+                                 20260518100146.jdtwh0b3.yz5.zip  (399 KB)
+  10:02:16 CEST  +00:00:30  [2]  DICOM uploaded to S3
+                                 s3://appway-bridge-prod/incoming/…/….dcm  (457 KB)
+  10:02:16 CEST  +00:00:30  [4]  Input downloaded by backend
+                                 s3://appway-bridge-prod/incoming/…/  (1 file(s))
+  10:02:18 CEST  +00:00:32  [5]  Backend processes (YOLO + ePDF)
+                                 Inference result: verdict=Negative, processing_time=1.28s
+  10:02:18 CEST  +00:00:32  [7]  Result enqueued on SQS appway-results
+  10:02:19 CEST  +00:00:33  [6]  ePDF result uploaded to S3
+  Waiting for stage [9]...  idle timeout in 9m 53s
   ...
-  [10:09:45 CEST  +00:07:59]  [9] Result stored in HEYEX
-               AshvinsDistribution/20260518100945.ya2uxkph.rtc.dcm
+  10:09:45 CEST  +00:07:59  [9]  Result stored in HEYEX
+                                 AshvinsDistribution/20260518100945.ya2uxkph.rtc.dcm
 
   Summary
   -------
@@ -243,7 +248,7 @@ python3 scripts/job_timeline.py final-5f1e35fa-3397-4604-b5c1-a7785919ea13 --liv
 |---|---|---|
 | `--live` | off | Stream events; exit on stage `[9]` or idle timeout |
 | `--interval SEC` | `5` | Poll interval in seconds (live mode) |
-| `--idle-timeout SEC` | `300` | Seconds of inactivity after stage `[7]` before auto-exit |
+| `--idle-timeout SEC` | `600` | Seconds of inactivity after stage `[6]` before auto-exit |
 | `--utc-only` | off | Show UTC timestamps only (useful for AWS support tickets) |
 | `--no-heyex` | off | Skip SSM queries to heyex2 (faster, backend-only view) |
 

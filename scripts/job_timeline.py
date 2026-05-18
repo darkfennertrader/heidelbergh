@@ -316,10 +316,14 @@ def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
         if "couldn't open file" in line.lower() or "could not read the dicom" in line.lower():
             bad_path = path_m.group(1) if path_m else "(unknown path)"
             if "click_error" not in found and ts is not None:
-                if job_origin_ts is None or abs((ts - job_origin_ts).total_seconds()) < 7200:
+                # Only record click errors that happened AFTER the job's DICOM was uploaded
+                # (strict >=). This prevents stale errors from earlier jobs appearing.
+                if job_origin_ts is None or ts >= job_origin_ts:
                     found["click_error"] = (ts, bad_path, line.strip()[:200])
         elif "ImagwPool" in line and ts is not None and "result_stored" not in found:
-            found["result_stored"] = (ts, path_m.group(1) if path_m else "?", None)
+            # Only accept a result_stored entry that happened AFTER the job was uploaded
+            if job_origin_ts is None or ts >= job_origin_ts:
+                found["result_stored"] = (ts, path_m.group(1) if path_m else "?", None)
 
     ps_appway = (
         r'$dir = "' + _APPWAY_LOG_DIR + r'"; '
@@ -345,7 +349,9 @@ def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
             if ts_m:
                 try:
                     ts = datetime.strptime(ts_m.group(1), "%m/%d/%Y %I:%M:%S %p").replace(tzinfo=CEST).astimezone(timezone.utc)
-                    found["result_stored"] = (ts, f"AshvinsDistribution/{line.split()[0]}", None)
+                    # Only accept if this .rtc.dcm was created after the job's DICOM upload
+                    if job_origin_ts is None or ts >= job_origin_ts:
+                        found["result_stored"] = (ts, f"AshvinsDistribution/{line.split()[0]}", None)
                 except ValueError:
                     pass
 
@@ -533,16 +539,60 @@ def render_timeline(job_id: str, stages: list[Stage], utc_only: bool = False) ->
 
 
 # ── streaming live helpers ────────────────────────────────────────────────────
+#
+# Column layout (fixed widths, plain ASCII):
+#
+#   TIME          ELAPSED    STAGE  LABEL
+#   ────────────  ─────────  ─────  ──────────────────────────────────────────
+#   10:02:16 CEST  +00:00:00   [4]  Input downloaded by backend
+#                                   s3://…/incoming/…/  (1 file)
+#
+# TIME     = 13 chars ("HH:MM:SS CEST")
+# ELAPSED  =  9 chars ("+HH:MM:SS")
+# STAGE    =  3 chars ("[N]")
+# LABEL/DETAIL = rest of line
+#
+# Header is emitted once; detail lines are indented to DETAIL_COL.
+
+_COL_TIME    = 13   # "HH:MM:SS CEST"
+_COL_ELAPSED =  9   # "+HH:MM:SS"
+_COL_STAGE   =  3   # "[N]"
+_COL_GAP     =  2   # spaces between columns
+_DETAIL_COL  = _COL_TIME + _COL_GAP + _COL_ELAPSED + _COL_GAP + _COL_STAGE + _COL_GAP  # indent for detail lines = 31
+
+
+def _stream_header(utc_only: bool) -> str:
+    tz_label = "UTC" if utc_only else "CEST"
+    time_hdr  = f"TIME ({tz_label})".ljust(_COL_TIME)
+    elap_hdr  = "ELAPSED".ljust(_COL_ELAPSED)
+    stage_hdr = "ST"
+    return (
+        f"\n  {time_hdr}  {elap_hdr}  {stage_hdr}  STAGE\n"
+        f"  {'─' * _COL_TIME}  {'─' * _COL_ELAPSED}  {'─' * _COL_STAGE}  {'─' * 42}"
+    )
+
 
 def _stream_stage_line(st: Stage, origin: datetime, utc_only: bool) -> str:
-    """Return a single terminal line for one newly-seen stage."""
-    ts_short = _fmt_ts_short(st.ts) if not utc_only else st.ts.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
-    delta    = _fmt_delta((st.ts - origin).total_seconds())
-    line     = f"  [{ts_short}  {delta}]  {st.tag} {st.label}"
-    if st.detail:
-        first_detail = st.detail.split("\n")[0].strip()
-        if first_detail:
-            line += f"\n               {first_detail}"
+    """Return one or two terminal lines for one newly-seen stage (fixed columns)."""
+    if utc_only:
+        ts_short = st.ts.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+    else:
+        ts_short = _fmt_ts_short(st.ts)           # "HH:MM:SS CEST"
+    delta = _fmt_delta((st.ts - origin).total_seconds())
+
+    # fixed-width columns
+    tc = ts_short.ljust(_COL_TIME)   # 13
+    ec = delta.ljust(_COL_ELAPSED)   # 9
+    sc = st.tag.ljust(_COL_STAGE)    # 3
+
+    line = f"  {tc}  {ec}  {sc}  {st.label}"
+
+    # detail line(s) indented to _DETAIL_COL
+    indent = " " * (2 + _DETAIL_COL)    # 2 for "  " prefix + column offset
+    for dl in st.detail.split("\n"):
+        dl = dl.strip()
+        if dl:
+            line += f"\n{indent}{dl}"
     return line
 
 
@@ -563,8 +613,8 @@ def main():
                             help="Stream new events as they appear; exit on stage [9] or idle timeout")
     parser.add_argument("--interval", type=int, default=5, metavar="SEC",
                         help="Poll interval for --live mode (default: 5 s)")
-    parser.add_argument("--idle-timeout", type=int, default=300, metavar="SEC",
-                        help="Seconds of no new events after stage [7] before auto-exit (default: 300)")
+    parser.add_argument("--idle-timeout", type=int, default=600, metavar="SEC",
+                        help="Seconds of no new events after stage [6] before auto-exit (default: 600)")
     parser.add_argument("--utc-only", action="store_true",
                         help="Show UTC timestamps only (default: CEST primary + UTC secondary)")
     parser.add_argument("--no-heyex", action="store_true",
@@ -635,7 +685,7 @@ def main():
     seen_numbers: set[str] = set()   # stage numbers already printed
     origin: Optional[datetime] = None
     last_new_event_time = time.monotonic()
-    stage7_seen = False
+    stage6_seen = False   # idle clock starts after stage [6] (result on S3)
 
     try:
         while True:
@@ -652,13 +702,17 @@ def main():
             for st in new_stages:
                 if origin is None:
                     origin = st.ts
+                    # print header row once, before the first data row
+                    hdr = _stream_header(args.utc_only)
+                    print(hdr)
+                    _log_write(hdr)
                 line = _stream_stage_line(st, origin, args.utc_only)
                 print(line)
                 _log_write(line)
                 seen_numbers.add(st.number)
                 last_new_event_time = time.monotonic()
-                if st.number == "7":
-                    stage7_seen = True
+                if st.number == "6":
+                    stage6_seen = True
 
             # exit conditions
             if "9" in seen_numbers:
@@ -670,7 +724,7 @@ def main():
                 _log_write(SEP)
                 break
 
-            if stage7_seen:
+            if stage6_seen:
                 idle = time.monotonic() - last_new_event_time
                 remaining = int(args.idle_timeout - idle)
                 if idle >= args.idle_timeout:
@@ -683,7 +737,9 @@ def main():
                     _log_write(SEP)
                     break
                 # show countdown on a single overwriting line
-                print(f"\r  Waiting for stage [9]...  idle timeout in {remaining}s", end="", flush=True)
+                mins, secs = divmod(remaining, 60)
+                countdown = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+                print(f"\r  Waiting for stage [9]...  idle timeout in {countdown}   ", end="", flush=True)
 
             time.sleep(args.interval)
 
