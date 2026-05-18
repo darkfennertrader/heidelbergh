@@ -633,8 +633,17 @@ def build_timeline(job_id: str) -> list[Stage]:
         stages.append(Stage("X", "User-click failure (can't reach this page)", ts,
                             f"Tried to open: {bad_path}\n  {msg[:200]}"))
 
-    # sort: timestamped stages first (chronological), None-ts last
-    stages.sort(key=lambda s: s.ts if s.ts is not None else datetime.max.replace(tzinfo=timezone.utc))
+    # sort: bucket timestamps into 2-second windows; within each window use
+    # stage number as tie-breaker so that (e.g.) [2] always precedes [3]/[4]
+    # even when the worker log has second-only precision and sorts "too early".
+    def _stage_sort_key(s: Stage):
+        if s.ts is None:
+            return (float("inf"), 99)
+        bucket = int(s.ts.timestamp()) // 2
+        num = int(s.number) if s.number.isdigit() else 99
+        return (bucket, num)
+
+    stages.sort(key=_stage_sort_key)
     return stages
 
 
@@ -832,13 +841,21 @@ def main():
         while True:
             stages = build_timeline(job_id)
 
-            # collect newly-resolved stages
+            # collect newly-resolved stages; use the same 2-second bucket +
+            # stage-number tie-breaker as build_timeline so the live stream
+            # always respects the canonical 1→9 order even when multiple
+            # stages are detected in the same 5-second poll.
             new_stages = [
                 s for s in stages
                 if s.ts is not None and s.number not in seen_numbers
             ]
-            # sort new stages by their actual timestamp
-            new_stages.sort(key=lambda s: s.ts)
+
+            def _live_sort_key(s: Stage):
+                bucket = int(s.ts.timestamp()) // 2
+                num = int(s.number) if s.number.isdigit() else 99
+                return (bucket, num)
+
+            new_stages.sort(key=_live_sort_key)
 
             for st in new_stages:
                 if origin is None:
@@ -860,8 +877,31 @@ def main():
                 last_new_event_time = time.monotonic()
                 if st.number == "6":
                     stage6_seen = True
+                # Small inter-line delay so stages trickle in visually rather
+                # than bursting all at once when a poll catches multiple events.
+                if new_stages.index(st) < len(new_stages) - 1:
+                    time.sleep(0.15)
 
-            # exit conditions
+            # exit conditions — before breaking on [9], do one final
+            # re-scan of AshvinsDistribution if [8] was not yet seen.
+            # Race: the ps_appway SSM command may have run fractionally
+            # before the .dcm appeared while ps_uvo (run after) caught [9].
+            if "9" in seen_numbers and "8" not in seen_numbers:
+                print("  (re-checking AshvinsDistribution for [8]...)", flush=True)
+                final_stages = build_timeline(job_id)
+                for fst in final_stages:
+                    if fst.number == "8" and fst.ts is not None:
+                        if origin is None:
+                            origin = fst.ts
+                        line = _stream_stage_line(fst, origin, args.utc_only)
+                        print(line)
+                        _log_write(line)
+                        seen_numbers.add("8")
+                        stages = final_stages   # use refreshed list for summary
+                        break
+                else:
+                    print("  (still not found — [8] may arrive in the next log rotation)", flush=True)
+
             if "9" in seen_numbers:
                 summary = _build_summary(stages, seen_numbers)
                 print(summary)

@@ -268,6 +268,12 @@ End-to-end pipeline latency observed on the production workstation (`EC2AMAZ-UIM
 > **Note — stage `[3]`**: The SQS `appway-jobs` enqueue happens within 1–2 s of the S3 upload (`[2]`) and is not independently observable. The tool emits it as a synthetic stage at the `[2]` timestamp.
 >
 > **Note — parallel jobs**: Each watcher pairs `[9]` with its own `[8]` (floored at `[8] ts − 5 s`) so two concurrent watchers never claim the same `AIResultBackup` folder.
+>
+> **Note — live-mode streaming behaviour**: When a single 5-second poll surfaces multiple new stages simultaneously, they are printed with a ~150 ms pause between each line so the output trickles in sequentially rather than bursting all at once. Timestamps shown are the real event times — only the *display* is paced.
+>
+> **Note — stage ordering within the same second**: Several stages share a near-identical timestamp (e.g. `[2]` from S3 has millisecond precision while `[4]` from the worker log has second precision only, so they can appear to collide). Both `build_timeline` and the live loop sort stages by **2-second time buckets**, then by canonical stage number within each bucket — so the output always reads `[1] → [2] → [3] → [4] → …` regardless of sub-second measurement noise.
+>
+> **Note — `[8]` / `[9]` race condition**: The tool queries `AshvinsDistribution` (for `[8]`) and `UVOBackup` (for `[9]`) as two sequential SSM round-trips (~2–4 s each). In rare cases `[8]` appears in the sub-second gap between the two queries: `[9]` is detected but `[8]` is not. The watcher handles this automatically: if `[9]` is seen but `[8]` is absent it does **one final re-scan** of `AshvinsDistribution` before exiting and emits `[8]` if it is now present. A one-line notice `(re-checking AshvinsDistribution for [8]...)` is printed when this path is taken.
 
 ### Troubleshooting: stage `[8]` never arrives
 
