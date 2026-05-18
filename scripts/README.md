@@ -159,60 +159,104 @@ first failure.
 
 ## 4. `job_timeline.py` — cross-system job timeline
 
-Assembles a human-readable end-to-end log of **all 9 pipeline stages** for a
-given job — from DICOM received on HEYEX 2 all the way to the result being
-stored back in HEYEX — and appends it to `logs/workflow.logs`.
+Streams a human-readable end-to-end log of **all 9 pipeline stages** for a
+job — from DICOM received on HEYEX 2 all the way to the result stored back
+in HEYEX — writing each stage line to **`logs/workflow.logs`** immediately
+as it is detected.
 
 ### Stages covered
 
-| # | Stage | Data source |
+| Tag | Stage | Data source |
 |---|---|---|
-| ① | DICOM received by AppWay Link (heyex2) | SSM-grep `AppWay Link\Logs\*.log` |
-| ② | DICOM uploaded to S3 `incoming/` | S3 `LastModified` |
-| ③ | Job enqueued on SQS appway-jobs | (derived ≈ stage ②) |
-| ④ | Input downloaded by backend | `journalctl -u appway-worker` / `STAGE 4/9` |
-| ⑤ | Backend processes (YOLO + ePDF) | journal `STAGE 5/9` |
-| ⑥ | ePDF result uploaded to S3 `results/` | journal `STAGE 6/9` + S3 `LastModified` |
-| ⑦ | Result enqueued on SQS appway-results | journal `STAGE 7/9` |
-| ⑧ | Result downloaded by AppWay Link | SSM-grep AppWay Link log |
-| ⑨ | Result stored into HEYEX | SSM-grep `MCAshvinsWorkstation.verbose.log` |
-| ✗ | User-click failure (if any) | SSM-grep `ThreadLoadDICOMReport` error |
-
-Each line shows:
-- `[+HH:MM:SS]` elapsed from stage ①
-- `YYYY-MM-DD HH:MM:SS CEST  (HH:MM:SS UTC)`  (primary CEST, secondary UTC)
-- Stage label + S3 path / local path + file size
+| `[1]` | DICOM received by AppWay Link (heyex2) | `AshvinsDistribution\` dir timestamps |
+| `[2]` | DICOM uploaded to S3 `incoming/` | S3 `LastModified` |
+| `[3]` | Job enqueued on SQS appway-jobs | (derived ≈ stage `[2]`) |
+| `[4]` | Input downloaded by backend | `/var/log/appway-worker.log` |
+| `[5]` | Backend processes (YOLO + ePDF) | `/var/log/appway-worker.log` |
+| `[6]` | ePDF result uploaded to S3 `results/` | `/var/log/appway-worker.log` + S3 |
+| `[7]` | Result enqueued on SQS appway-results | `/var/log/appway-worker.log` |
+| `[8]` | Result downloaded by AppWay Link | `AshvinsDistribution\` dir (`.zip` file) |
+| `[9]` | Result stored into HEYEX | SSM → `MCAshvinsWorkstation.verbose.log` |
+| `[X]` | User-click failure (if any) | SSM → `MCAshvinsWorkstation.verbose.log` |
 
 ### Usage
 
+#### Recommended workflow — start the watcher *before* dragging the DCM into HEYEX
+
 ```bash
-# One-shot — query all sources once, print, append to logs/workflow.logs:
+# Terminal 1: start watcher (auto-detects new job, streams stages as they arrive)
+python3 scripts/job_timeline.py --live
+
+# Terminal 2 (optional): watch the log file grow in real time
+tail -f logs/workflow.logs
+```
+
+The script prints:
+```
+  Live mode — waiting for a new job in s3://appway-bridge-prod/incoming/
+  (started at 2026-05-18 10:00:00 CEST · poll every 5s · Ctrl-C to stop)
+  Waiting...  3s elapsed
+  New job: final-41707dc3-…  (uploaded 2026-05-18 10:01:46 CEST)
+
+  AppWay job:  final-41707dc3-b8f7-4a9e-bbcc-9ee8738adecd
+  Watching at: 2026-05-18 10:01:47 CEST  (08:01:47 UTC)
+
+  [10:01:46 CEST  +00:00:00]  [8] Result downloaded by AppWay Link
+               20260518100146.jdtwh0b3.yz5.zip  (399 KB)
+  [10:02:16 CEST  +00:00:30]  [2] DICOM uploaded to S3
+  [10:02:16 CEST  +00:00:30]  [4] Input downloaded by backend
+  [10:02:18 CEST  +00:00:32]  [5] Backend processes (YOLO + ePDF)
+               Inference result: verdict=Negative, processing_time=1.28s
+  [10:02:18 CEST  +00:00:32]  [7] Result enqueued on SQS appway-results
+  [10:02:19 CEST  +00:00:33]  [6] ePDF result uploaded to S3
+  Waiting for stage [9]...  idle timeout in 297s
+  ...
+  [10:09:45 CEST  +00:07:59]  [9] Result stored in HEYEX
+               AshvinsDistribution/20260518100945.ya2uxkph.rtc.dcm
+
+  Summary
+  -------
+  Stages seen   : [2] [4] [5] [6] [7] [8] [9]
+  Stages missed : [1] [3]
+  Total elapsed:  7m 59s   ([8] -> [9])
+```
+
+#### One-shot (auto-detect newest job already in S3)
+
+```bash
+python3 scripts/job_timeline.py
+```
+
+#### Explicit job-id
+
+```bash
+# One-shot:
 python3 scripts/job_timeline.py final-5f1e35fa-3397-4604-b5c1-a7785919ea13
 
-# Live mode — re-query every 5 s, auto-exit when stage ⑨ appears:
-python3 scripts/job_timeline.py final-5f1e35fa-… --live
-
-# Faster live refresh:
-python3 scripts/job_timeline.py final-5f1e35fa-… --live --interval 10
-
-# UTC timestamps only (for AWS support tickets):
-python3 scripts/job_timeline.py final-5f1e35fa-… --utc-only
-
-# Skip SSM queries (backend-only view, faster):
-python3 scripts/job_timeline.py final-5f1e35fa-… --no-heyex
+# Live:
+python3 scripts/job_timeline.py final-5f1e35fa-3397-4604-b5c1-a7785919ea13 --live
 ```
 
-### Output file
+### Flag reference
 
-All timelines are **appended** (never overwritten) to:
+| Flag | Default | Description |
+|---|---|---|
+| `--live` | off | Stream events; exit on stage `[9]` or idle timeout |
+| `--interval SEC` | `5` | Poll interval in seconds (live mode) |
+| `--idle-timeout SEC` | `300` | Seconds of inactivity after stage `[7]` before auto-exit |
+| `--utc-only` | off | Show UTC timestamps only (useful for AWS support tickets) |
+| `--no-heyex` | off | Skip SSM queries to heyex2 (faster, backend-only view) |
 
-```
-logs/workflow.logs
-```
+### Output file — `logs/workflow.logs`
 
-The `logs/` directory is committed (via `logs/.gitkeep`) but `*.logs` and
-`*.log` files inside it are ignored by `.gitignore` — so the log accumulates
-on each operator's machine without polluting the repo.
+- Each stage line is written to `logs/workflow.logs` **immediately** when
+  detected — not only when the job finishes.
+- The watcher exits cleanly (with a summary + separator) on **four** paths:
+  stage `[9]` seen · idle timeout · Ctrl-C · any unhandled error.
+- The file is **appended**, never overwritten — safe to run multiple jobs in
+  sequence without losing history.
+- `logs/workflow.logs` is in `.gitignore`; the directory is tracked via
+  `logs/.gitkeep`.  To start fresh: `rm logs/workflow.logs`.
 
 ### Requirements
 
@@ -220,25 +264,47 @@ on each operator's machine without polluting the repo.
 - EC2 IAM role: `s3:ListBucket` + `s3:GetObject` on `appway-bridge-prod`,
   `ssm:SendCommand` + `ssm:GetCommandInvocation` for both
   `i-02a7dd1797d85a099` (heyex2) and `i-02a99abeba370f0a7` (backend).
-- `journalctl` — available when running on the backend EC2; otherwise
-  the script falls back to SSM automatically.
 
 ---
 
-## Quick recipe — full end-to-end test
+## Quick recipe — full end-to-end test (HEYEX UI flow)
 
 ```bash
-# 1. Build a synthetic DICOM from a folder of OCT slices
+# 1. Build a fresh synthetic DICOM from example images
 scripts/build_test_dcm.sh \
-    --input  ~/samples/case_42 \
-    --output /tmp/
+    --input  docs/examples/images \
+    --output docs/examples
+# → docs/examples/test_NNNNNN.dcm
 
-# 2. Push it through the pipeline (watches the log)
+# 2. Start the job watcher BEFORE you drag the file into HEYEX
+python3 scripts/job_timeline.py --live
+#    (in another terminal, optionally):
+#    tail -f logs/workflow.logs
+
+# 3. Drag docs/examples/test_NNNNNN.dcm into the HEYEX 2 UI
+#    The watcher auto-detects the new job and streams each stage as it arrives.
+#    It exits automatically when stage [9] lands (or after 5 min idle).
+
+# 4. Review the produced PDF in the HEYEX UI.
+#    Full timestamped record is in:
+cat logs/workflow.logs | tail -50
+
+# 5. Wipe test-* artefacts from S3 + local outputs
+scripts/cleanup_test_jobs.sh
+```
+
+## Quick recipe — pipeline-only test (no HEYEX UI, inject_job.sh)
+
+```bash
+# 1. Build DICOM
+scripts/build_test_dcm.sh --input docs/examples/images --output /tmp/
+
+# 2. Push directly through S3 + SQS (no HEYEX UI required)
 scripts/inject_job.sh --files /tmp/test_*.dcm
 
-# 3. Review the result
+# 3. Review result
 xdg-open outputs/test-*/result.pdf
 
-# 4. When you're done, wipe every test-* artefact from all four locations
+# 4. Cleanup
 scripts/cleanup_test_jobs.sh
 ```
