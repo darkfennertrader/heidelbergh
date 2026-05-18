@@ -575,6 +575,16 @@ def build_timeline(job_id: str) -> list[Stage]:
             break
     stages.append(Stage("7", "Result enqueued on SQS appway-results", enq_ts, enq_detail))
 
+    # [3] Job enqueued on SQS appway-jobs
+    # This is a synthetic stage: the SQS enqueue happens at approximately the same
+    # time as the S3 upload ([2]).  We emit it at the [2] timestamp (or the first
+    # worker log timestamp if available) so it appears in the timeline and summary
+    # rather than always being listed as "missed".
+    s3_job_ts = s3_incoming[0]["last_modified"] if s3_incoming else None
+    job_enq_ts = s3_job_ts  # best-available proxy; usually within 1-2 s of actual enqueue
+    stages.append(Stage("3", "Job enqueued on SQS appway-jobs",
+                        job_enq_ts, "(derived ≈ S3 upload time)"))
+
     # [1] [8] [9] [X] from heyex2 via SSM
     job_origin_ts = s3_incoming[0]["last_modified"] if s3_incoming else None
     heyex_data    = _heyex_grep(job_id, job_origin_ts=job_origin_ts)
@@ -726,13 +736,18 @@ def main():
                             help="Stream new events as they appear; exit on stage [9] or idle timeout")
     parser.add_argument("--interval", type=int, default=5, metavar="SEC",
                         help="Poll interval for --live mode (default: 5 s)")
-    parser.add_argument("--idle-timeout", type=int, default=300, metavar="SEC",
-                        help="Seconds of no new events after stage [6] before auto-exit (default: 300)")
+    parser.add_argument("--idle-timeout", type=int, default=900, metavar="SEC",
+                        help="Seconds of no new events after stage [6] before auto-exit (default: 900 = 15 min)")
+    parser.add_argument("--quick", action="store_true",
+                        help="Shortcut for --idle-timeout 300 (5 min); useful for dev/CI runs")
     parser.add_argument("--utc-only", action="store_true",
                         help="Show UTC timestamps only (default: CEST primary + UTC secondary)")
     parser.add_argument("--no-heyex", action="store_true",
                         help="Skip SSM queries to heyex2 (faster, backend-only view)")
     args = parser.parse_args()
+
+    if args.quick:
+        args.idle_timeout = 300
 
     if args.live:
         args.one_shot = False
@@ -847,7 +862,7 @@ def main():
                 idle = time.monotonic() - last_new_event_time
                 remaining = int(args.idle_timeout - idle)
                 if idle >= args.idle_timeout:
-                    msg = f"\n  (!) Idle timeout reached — stage [9] not detected; exiting."
+                    msg = f"\n  (!) Idle timeout reached — stages [8]/[9] not detected; exiting."
                     print(msg)
                     _log_write(msg)
                     summary = _build_summary(stages, seen_numbers)
@@ -855,10 +870,14 @@ def main():
                     _log_write(summary)
                     _log_write(SEP)
                     break
-                # show countdown on a single overwriting line
+                # show countdown on a single overwriting line; indicate which stage we're waiting for
                 mins, secs = divmod(remaining, 60)
                 countdown = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-                print(f"\r  Waiting for stage [9]...  idle timeout in {countdown}   ", end="", flush=True)
+                if "8" not in seen_numbers:
+                    waiting_for = "[8] (AppWay Link → drop folder)"
+                else:
+                    waiting_for = "[9] (HEYEX importing AI result)"
+                print(f"\r  Waiting for {waiting_for}...  idle timeout in {countdown}   ", end="", flush=True)
 
             time.sleep(args.interval)
 

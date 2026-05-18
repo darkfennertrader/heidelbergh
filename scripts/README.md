@@ -248,9 +248,35 @@ python3 scripts/job_timeline.py final-5f1e35fa-3397-4604-b5c1-a7785919ea13 --liv
 |---|---|---|
 | `--live` | off | Stream events; exit on stage `[9]` or idle timeout |
 | `--interval SEC` | `5` | Poll interval in seconds (live mode) |
-| `--idle-timeout SEC` | `600` | Seconds of inactivity after stage `[6]` before auto-exit |
+| `--idle-timeout SEC` | `900` | Seconds of inactivity after stage `[6]` before auto-exit (15 min) |
+| `--quick` | off | Shortcut for `--idle-timeout 300` (5 min); useful for dev/CI runs |
 | `--utc-only` | off | Show UTC timestamps only (useful for AWS support tickets) |
 | `--no-heyex` | off | Skip SSM queries to heyex2 (faster, backend-only view) |
+
+### Realistic timing expectations
+
+End-to-end pipeline latency observed on the production workstation (`EC2AMAZ-UIM0T5T`):
+
+| Window | Typical | Worst observed | Notes |
+|---|---|---|---|
+| `[1]` → `[2]` | −30 s | −60 s | AppWay zips *before* S3 upload; `[1]` is always earlier than `[2]` |
+| `[2]` → `[7]` | ~3 s | ~10 s | Cloud AI pipeline (S3 upload → YOLO inference → ePDF → S3 result → SQS) |
+| `[7]` → `[8]` | 1–2 min | 4 min | AppWay Link polls S3 results and writes result `.dcm` to drop folder |
+| `[8]` → `[9]` | ~10 s | 10–11 min | HEYEX imports the AI result; duration varies widely |
+| **`[1]` → `[9]` total** | **3–4 min** | **~15 min** | |
+
+> **Note — stage `[3]`**: The SQS `appway-jobs` enqueue happens within 1–2 s of the S3 upload (`[2]`) and is not independently observable. The tool emits it as a synthetic stage at the `[2]` timestamp.
+
+### Troubleshooting: stage `[8]` never arrives
+
+If the watcher counts down past `[6]`/`[7]` but `[8]` never fires, AppWay Link is not picking up the result from S3. Symptoms in the logs:
+
+- `MCAshvinsWorkstation.verbose.log` stops updating after a `MiiiDcmFile constructor error, couldn't open file \\<hostname>\…` stack trace
+- `AshvinsDistribution\` contains only the input `.zip` (no new `.dcm`)
+
+**Likely cause**: The WebView2 "can't reach this page" click-error puts the AppWay Link polling thread into a stuck state. The system typically self-recovers after 10–15 min, or can be unstuck by restarting `MCAshvinsWorkstation`.
+
+**What to do**: Wait for the 15-minute idle timeout. If `[8]` still never appears, check `C:\HEYEX\logfiles\MCAshvinsWorkstation.verbose.log` for the last stack trace and file a support request with Heidelberg (team-ashvins@heidelbergengineering.com) attaching the full `logfiles\` folder.
 
 ### Output file — `logs/workflow.logs`
 
