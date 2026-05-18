@@ -4,11 +4,11 @@ DICOM processor. Per-job local layout:
     outputs/<job-id>/
         <dicom-stem-1>/
             metadata.json          DICOM header (no pixel data)
-            image.png              single-frame, OR
-            image_frame000.png …   multi-frame volume, one PNG per slice
+            <dicom-stem-1>.png     single-frame, OR
+            frame000.png …         multi-frame volume, one PNG per slice
         <dicom-stem-2>/
             metadata.json
-            image.png
+            <dicom-stem-2>.png
         result.pdf                 single combined report (also embedded in result.dcm)
 
     ~/appway-workdir/<job-id>/output/result.dcm   ← only uploaded to S3 (1 per job)
@@ -302,7 +302,7 @@ def process(job_id: str, input_dir: Path, output_dir: Path) -> None:
 
         # Per-DICOM subdirectory keeps each .dcm file's artefacts together:
         #   outputs/<job-id>/<stem>/metadata.json
-        #   outputs/<job-id>/<stem>/image.png                (single-frame DICOM)
+        #   outputs/<job-id>/<stem>/<stem>.png               (single-frame DICOM)
         #   outputs/<job-id>/<stem>/frame000.png, frame001.png, …  (multi-frame volume)
         dicom_dir = job_outputs_dir / stem
         dicom_dir.mkdir(parents=True, exist_ok=True)
@@ -318,11 +318,15 @@ def process(job_id: str, input_dir: Path, output_dir: Path) -> None:
             logger.error("[%s]   Metadata extraction failed for %s: %s", job_id, src.name, e)
 
         # --- Pixel data → PNG ---
-        # Using `image.png` as the base name keeps things uniform across
-        # single-frame and multi-frame DICOMs — `_dicom_to_png()` will
-        # automatically produce `frame000.png`, `frame001.png`… for volumes.
+        # Use the DICOM stem as the PNG filename so the report's
+        # "Per-Image Results" table shows the original input filename
+        # (e.g. "20260518132053.rfzyz2kj.oer.png") rather than a
+        # generic "image.png".  For multi-frame volumes _dicom_to_png()
+        # overrides the dest stem anyway (using ImageComments CSV labels
+        # or per-frame B-scan metadata), so this only matters for
+        # single-frame DICOMs.
         try:
-            png_path = dicom_dir / "image.png"
+            png_path = dicom_dir / f"{stem}.png"
             _dicom_to_png(ds, png_path)
             logger.info("[%s]   PNG saved → %s", job_id, png_path)
         except Exception as e:
