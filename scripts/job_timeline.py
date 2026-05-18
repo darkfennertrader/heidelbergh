@@ -16,7 +16,7 @@ Stages covered
    [6]  Result uploaded to S3 results/              S3 object LastModified
    [7]  Result message enqueued on appway-results   /var/log/appway-worker.log
    [8]  Result stored by AppWay Link                heyex2 AshvinsDistribution .dcm
-   [9]  Result stored into HEYEX                    heyex2 UVOBackup UVOJob-*-DeleteImage-Done
+   [9]  Result stored into HEYEX                    heyex2 UVOBackup AIResultBackup-<uuid> folder
    [X]  (if present) user-click failure             heyex2 MCAshvinsWorkstation log
 
 Usage
@@ -393,27 +393,40 @@ def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
                 if size_val is None or size_val < 100_000:
                     found["result_downloaded"] = (ts, filename)   # stage [8]
 
-    # ── [9] from UVOBackup DeleteImage-Done folders ───────────────────────────
-    # Fetch both AIResultBackup and UVOJob-*-Done folders so we can understand
-    # the sequence. We only fire [9] on a DeleteImage-Done folder.
+    # ── [9] from UVOBackup AIResultBackup folders ────────────────────────────
+    # Confirmed behaviour (2026-05-18 live testing):
+    #   • HEYEX creates AIResultBackup-<uuid> when it STARTS importing the AI
+    #     result; this is when the report becomes visible in the UI (~1 s after [8]).
+    #   • UVOJob-N-DeleteImage-Done appears later (seconds → minutes) as a
+    #     background cleanup step — NOT the right trigger for "report is ready".
+    #
+    # Parallel-job correctness:
+    #   We floor the search at (this job's [8] timestamp − 5 s) so that two
+    #   concurrent watchers never claim the same AIResultBackup folder.
+    #   The "result_downloaded" key carries the [8] timestamp if already found.
+    floor_ts = job_origin_ts  # default: no [8] yet, fall back to job_origin_ts
+    if "result_downloaded" in found:
+        rd_ts = found["result_downloaded"][0]
+        floor_ts = rd_ts - timedelta(seconds=5)
+
     ps_uvo = (
         r'$dir = "' + _UVOB_DIR + r'"; '
         r'if (Test-Path $dir) { '
         r'  Get-ChildItem $dir -ErrorAction SilentlyContinue | '
-        r'  Where-Object { $_.Name -like "*AIResultBackup*" -or $_.Name -like "*DeleteImage-Done*" } | '
+        r'  Where-Object { $_.Name -like "*AIResultBackup*" } | '
         r'  Sort-Object CreationTime -Descending | Select-Object -First 20 | '
         r'  Select-Object Name, CreationTime | Format-Table -AutoSize -Wrap '
         r'} else { "DIR_NOT_FOUND" }'
     )
     uvo_out = ssm_run(HEYEX2_INSTANCE, ps_uvo)
 
-    # Collect all dated entries from the UVOBackup listing
+    # Collect all AIResultBackup entries, sorted ascending
     _uvo_entries: list[tuple[datetime, str]] = []
     for line in uvo_out.splitlines():
         line = line.strip()
-        if not line:
+        if "AIResultBackup" not in line:
             continue
-        # Try folder-name embedded timestamp first (most accurate, CEST)
+        # Prefer folder-name embedded timestamp (most accurate, CEST)
         fn_m = _FOLDER_TS_RE.search(line)
         ts   = _parse_folder_ts(fn_m.group(1)) if fn_m else None
         # Fall back to Format-Table CreationTime column
@@ -430,18 +443,17 @@ def _heyex_grep(job_id: str, job_origin_ts: Optional[datetime] = None) -> dict:
         folder_name = name_parts[0] if name_parts else line[:120]
         _uvo_entries.append((ts, folder_name))
 
-    # Sort ascending so we can find the first Done after job_origin_ts
     _uvo_entries.sort(key=lambda x: x[0])
 
     for ts, folder_name in _uvo_entries:
-        if job_origin_ts is not None and ts < job_origin_ts:
+        # Use floor_ts for tight pairing with [8] (parallel-job safety)
+        if floor_ts is not None and ts < floor_ts:
             continue
-        if "DeleteImage-Done" in folder_name and "result_stored" not in found:
-            # Extract the job-sequence number for the detail label
-            seq_m = re.search(r"UVOJob-(\d+)-DeleteImage-Done", folder_name)
-            label = f"UVOBackup/…UVOJob-{seq_m.group(1)}-DeleteImage-Done" if seq_m else folder_name[:80]
+        if "AIResultBackup" in folder_name and "result_stored" not in found:
+            uuid_m = re.search(r"AIResultBackup-([0-9a-f-]{36})", folder_name)
+            label  = f"UVOBackup/…AIResultBackup-{uuid_m.group(1)}" if uuid_m else folder_name[:80]
             found["result_stored"] = (ts, label, None)
-            break   # take the first one after job_origin_ts
+            break
 
     # ── [X] click errors from MCAshvinsWorkstation.verbose.log ────────────────
     ps_heyex = (
@@ -607,13 +619,14 @@ def build_timeline(job_id: str) -> list[Stage]:
         stages.append(Stage("8", "Result stored by AppWay Link", None,
                             "(no result .dcm found in AshvinsDistribution yet)"))
 
-    # [9] HEYEX finished storing AI result (UVOJob-*-DeleteImage-Done in UVOBackup)
+    # [9] HEYEX started importing AI result (AIResultBackup-<uuid> in UVOBackup)
+    # This is when the report becomes visible in the HEYEX UI.
     if "result_stored" in heyex_data:
         ts, label, _ = heyex_data["result_stored"]
         stages.append(Stage("9", "Result stored in HEYEX", ts, label))
     else:
         stages.append(Stage("9", "Result stored in HEYEX", None,
-                            "(no UVOJob-*-DeleteImage-Done found in UVOBackup yet)"))
+                            "(no AIResultBackup-* folder found in UVOBackup yet)"))
 
     if "click_error" in heyex_data:
         ts, bad_path, msg = heyex_data["click_error"]

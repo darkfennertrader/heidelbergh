@@ -176,7 +176,7 @@ as it is detected.
 | `[6]` | ePDF result uploaded to S3 `results/` | `/var/log/appway-worker.log` + S3 | |
 | `[7]` | Result enqueued on SQS appway-results | `/var/log/appway-worker.log` | |
 | `[8]` | Result stored by AppWay Link | `AshvinsDistribution\` — small `.dcm` file (<100 KB) | Result file, **not** `.rtc.dcm` — confirmed on live traffic |
-| `[9]` | Result stored into HEYEX (import done) | `UVOBackup\…-UVOJob-N-DeleteImage-Done` folder | HEYEX creates `AIResultBackup-*` when import *starts*, then `UVOJob-N-DeleteImage-Done` when import *finishes* — we fire on the Done folder |
+| `[9]` | Result stored into HEYEX | `UVOBackup\…-AIResultBackup-<uuid>` folder | HEYEX creates this folder when it starts importing; this is when the report becomes **visible in the UI** (~1 s after `[8]`). The later `UVOJob-N-DeleteImage-Done` is a background cleanup not related to UI visibility. |
 | `[X]` | User-click failure (if any) | SSM → `MCAshvinsWorkstation.verbose.log` | WebView2 "can't reach this page" error |
 
 ### Usage
@@ -262,10 +262,12 @@ End-to-end pipeline latency observed on the production workstation (`EC2AMAZ-UIM
 | `[1]` → `[2]` | −30 s | −60 s | AppWay zips *before* S3 upload; `[1]` is always earlier than `[2]` |
 | `[2]` → `[7]` | ~3 s | ~10 s | Cloud AI pipeline (S3 upload → YOLO inference → ePDF → S3 result → SQS) |
 | `[7]` → `[8]` | 1–2 min | 4 min | AppWay Link polls S3 results and writes result `.dcm` to drop folder |
-| `[8]` → `[9]` | ~10 s | 10–11 min | HEYEX imports the AI result; duration varies widely |
+| `[8]` → `[9]` | ~1 s | ~5 s | HEYEX creates the `AIResultBackup` folder almost immediately after `[8]`; report is visible in the UI at this point |
 | **`[1]` → `[9]` total** | **3–4 min** | **~15 min** | |
 
 > **Note — stage `[3]`**: The SQS `appway-jobs` enqueue happens within 1–2 s of the S3 upload (`[2]`) and is not independently observable. The tool emits it as a synthetic stage at the `[2]` timestamp.
+>
+> **Note — parallel jobs**: Each watcher pairs `[9]` with its own `[8]` (floored at `[8] ts − 5 s`) so two concurrent watchers never claim the same `AIResultBackup` folder.
 
 ### Troubleshooting: stage `[8]` never arrives
 
