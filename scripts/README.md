@@ -1,13 +1,14 @@
 # `scripts/` — Operator Helpers for the AppWay Backend
 
-Three shell scripts that let you exercise the **MyopicCNV+ backend** end-to-end
-from the Linux EC2 without needing the Windows AppWay Link side to be online.
+Three shell scripts and one Python utility that let you exercise and observe
+the **MyopicCNV+ backend** end-to-end.
 
 | Script | Purpose |
 |---|---|
 | [`build_test_dcm.sh`](./build_test_dcm.sh) | Build a **synthetic multi-frame OPT DICOM** from a folder of JPEG/PNG images. |
 | [`inject_job.sh`](./inject_job.sh) | Push one or more `.dcm` files through the pipeline (S3 upload + SQS job + log tail). |
 | [`cleanup_test_jobs.sh`](./cleanup_test_jobs.sh) | Delete every `test-*` artefact from S3, the local `outputs/` dir, and the Windows `AISolutionFolder`. |
+| [`job_timeline.py`](./job_timeline.py) | Print a **cross-system timeline** for a job (HEYEX → S3 → backend → S3 → HEYEX) and append it to `logs/workflow.logs`. |
 
 Typical flow:
 
@@ -16,9 +17,13 @@ Typical flow:
 │ build_test_dcm.sh   │ → │ inject_job.sh    │ → │ cleanup_test_jobs.sh │
 │ (JPEG/PNG → .dcm)   │   │ (run pipeline)   │   │ (wipe all test-*)    │
 └─────────────────────┘   └──────────────────┘   └──────────────────────┘
+         ↓ at any point
+┌─────────────────────────────────────────────────────────────────────────┐
+│ job_timeline.py <job-id>   →   logs/workflow.logs                       │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-All three scripts are already `chmod +x` and assume the project venv is at
+All three shell scripts are already `chmod +x` and assume the project venv is at
 `/home/ubuntu/appway-backend/.venv` (created via `uv sync`).
 
 ---
@@ -149,6 +154,74 @@ first failure.
 - EC2 IAM role: `s3:ListBucket` + `s3:DeleteObject` on `appway-bridge-prod`
   and `ssm:SendCommand` / `ssm:GetCommandInvocation` for the Windows EC2
   `i-02a99abeba370f0a7`.
+
+---
+
+## 4. `job_timeline.py` — cross-system job timeline
+
+Assembles a human-readable end-to-end log of **all 9 pipeline stages** for a
+given job — from DICOM received on HEYEX 2 all the way to the result being
+stored back in HEYEX — and appends it to `logs/workflow.logs`.
+
+### Stages covered
+
+| # | Stage | Data source |
+|---|---|---|
+| ① | DICOM received by AppWay Link (heyex2) | SSM-grep `AppWay Link\Logs\*.log` |
+| ② | DICOM uploaded to S3 `incoming/` | S3 `LastModified` |
+| ③ | Job enqueued on SQS appway-jobs | (derived ≈ stage ②) |
+| ④ | Input downloaded by backend | `journalctl -u appway-worker` / `STAGE 4/9` |
+| ⑤ | Backend processes (YOLO + ePDF) | journal `STAGE 5/9` |
+| ⑥ | ePDF result uploaded to S3 `results/` | journal `STAGE 6/9` + S3 `LastModified` |
+| ⑦ | Result enqueued on SQS appway-results | journal `STAGE 7/9` |
+| ⑧ | Result downloaded by AppWay Link | SSM-grep AppWay Link log |
+| ⑨ | Result stored into HEYEX | SSM-grep `MCAshvinsWorkstation.verbose.log` |
+| ✗ | User-click failure (if any) | SSM-grep `ThreadLoadDICOMReport` error |
+
+Each line shows:
+- `[+HH:MM:SS]` elapsed from stage ①
+- `YYYY-MM-DD HH:MM:SS CEST  (HH:MM:SS UTC)`  (primary CEST, secondary UTC)
+- Stage label + S3 path / local path + file size
+
+### Usage
+
+```bash
+# One-shot — query all sources once, print, append to logs/workflow.logs:
+python3 scripts/job_timeline.py final-5f1e35fa-3397-4604-b5c1-a7785919ea13
+
+# Live mode — re-query every 5 s, auto-exit when stage ⑨ appears:
+python3 scripts/job_timeline.py final-5f1e35fa-… --live
+
+# Faster live refresh:
+python3 scripts/job_timeline.py final-5f1e35fa-… --live --interval 10
+
+# UTC timestamps only (for AWS support tickets):
+python3 scripts/job_timeline.py final-5f1e35fa-… --utc-only
+
+# Skip SSM queries (backend-only view, faster):
+python3 scripts/job_timeline.py final-5f1e35fa-… --no-heyex
+```
+
+### Output file
+
+All timelines are **appended** (never overwritten) to:
+
+```
+logs/workflow.logs
+```
+
+The `logs/` directory is committed (via `logs/.gitkeep`) but `*.logs` and
+`*.log` files inside it are ignored by `.gitignore` — so the log accumulates
+on each operator's machine without polluting the repo.
+
+### Requirements
+
+- Project venv with `boto3` (`uv sync`).
+- EC2 IAM role: `s3:ListBucket` + `s3:GetObject` on `appway-bridge-prod`,
+  `ssm:SendCommand` + `ssm:GetCommandInvocation` for both
+  `i-02a7dd1797d85a099` (heyex2) and `i-02a99abeba370f0a7` (backend).
+- `journalctl` — available when running on the backend EC2; otherwise
+  the script falls back to SSM automatically.
 
 ---
 

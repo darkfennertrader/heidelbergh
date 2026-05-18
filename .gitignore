@@ -18,6 +18,10 @@ outputs/
 models/
 docs/
 
+# Job timeline logs — keep the directory (via .gitkeep) but ignore log files
+logs/*.logs
+logs/*.log
+
 # Layout sandbox — kept on disk for reference but never committed.
 # Contains: build_page_templates.py, run.py, sample_data.py and
 # the outputs/ / sample_images/ / ai_inspect/ artefacts.

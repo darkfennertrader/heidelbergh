@@ -250,17 +250,31 @@ def _handle_job(msg: dict) -> None:
             # Step 12 — download input from S3
             logger.info("[%s] Downloading input from s3://%s/%s", job_id, config.S3_BUCKET, input_prefix)
             s3_utils.download_prefix(input_prefix, input_dir)
+            _dcm_files = list(input_dir.rglob("*.dcm"))
+            _total_bytes = sum(f.stat().st_size for f in _dcm_files)
+            logger.info(
+                "[%s] STAGE 4/9 download_done files=%d size_bytes=%d s3_prefix=%s local_dir=%s",
+                job_id, len(_dcm_files), _total_bytes, input_prefix, input_dir,
+            )
 
             # Step 13 — process
-            logger.info("[%s] Processing…", job_id)
+            logger.info("[%s] STAGE 5/9 processing_start", job_id)
             process(job_id, input_dir, output_dir)
+            logger.info("[%s] STAGE 5/9 processing_done", job_id)
 
             # Step 14 — upload output to S3
             logger.info("[%s] Uploading output to s3://%s/%s", job_id, config.S3_BUCKET, result_prefix)
             s3_utils.upload_directory(output_dir, result_prefix)
+            _result_dcm = output_dir / "result.dcm"
+            _result_bytes = _result_dcm.stat().st_size if _result_dcm.exists() else 0
+            logger.info(
+                "[%s] STAGE 6/9 upload_done s3_key=%sresult.dcm size_bytes=%d",
+                job_id, result_prefix, _result_bytes,
+            )
 
             # Step 15 — send result message to appway-results
             sqs_utils.send_result_message(job_id, result_prefix)
+            logger.info("[%s] STAGE 7/9 result_enqueued", job_id)
 
         # Step 16 — delete job message from appway-jobs (heartbeat stopped)
         sqs_utils.delete_message(receipt_handle)
