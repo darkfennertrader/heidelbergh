@@ -269,10 +269,10 @@ def build_report_pdf(
     # ── Cover ─────────────────────────────────────────────────────────────────
     story.append(Spacer(1, 0.5*cm))
     story.append(Paragraph("MyopicCNV+", ParagraphStyle(
-        "Brand", fontName=_font(bold=True), fontSize=26, textColor=_BRAND,
+        "Brand", fontName=_font(bold=True), fontSize=26, leading=32, spaceAfter=4, textColor=_BRAND,
     )))
     story.append(Paragraph("Clinical Analysis Digest", ParagraphStyle(
-        "Sub", fontName=_font(semi=True), fontSize=14, textColor=_DARK, spaceAfter=2,
+        "Sub", fontName=_font(semi=True), fontSize=14, leading=18, spaceAfter=4, textColor=_DARK,
     )))
     story.append(HRFlowable(width="100%", thickness=2, color=_BRAND, spaceAfter=6))
 
@@ -304,18 +304,28 @@ def build_report_pdf(
         ("TEXTCOLOR",     (0, 0), (-1, 0),  colors.white),
         ("FONTNAME",      (0, 0), (-1, 0),  _font(bold=True)),
         ("FONTSIZE",      (0, 0), (-1, 0),  9),
+        ("LEADING",       (0, 0), (-1, 0),  13),
         ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
         ("FONTNAME",      (0, 1), (-1, 1),  _font(bold=True)),
         ("FONTSIZE",      (0, 1), (-1, 1),  22),
+        ("LEADING",       (0, 1), (-1, 1),  28),
         ("TEXTCOLOR",     (0, 1), (0, 1),   _DARK),
         ("TEXTCOLOR",     (1, 1), (1, 1),   _POSITIVE),
         ("TEXTCOLOR",     (2, 1), (2, 1),   _NEGATIVE),
         ("TEXTCOLOR",     (3, 1), (3, 1),   _DARK),
-        ("TOPPADDING",    (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING",    (0, 0), (-1, 0),  6),
+        ("BOTTOMPADDING", (0, 0), (-1, 0),  6),
+        ("TOPPADDING",    (0, 1), (-1, 1),  10),
+        ("BOTTOMPADDING", (0, 1), (-1, 1),  10),
         ("GRID",          (0, 0), (-1, -1), 0.4, _MID_GREY),
     ])
-    story.append(Table(headline_data, colWidths=[113]*4, style=headline_style))
+    story.append(Table(
+        headline_data,
+        colWidths=[113]*4,
+        rowHeights=[24, 48],
+        style=headline_style,
+    ))
     story.append(Spacer(1, 0.4*cm))
 
     # Download link

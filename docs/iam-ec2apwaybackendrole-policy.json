@@ -1,0 +1,84 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "SQSJobs",
+            "Effect": "Allow",
+            "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes",
+                "sqs:ChangeMessageVisibility"
+            ],
+            "Resource": "arn:aws:sqs:eu-west-1:911167932273:appway-jobs"
+        },
+        {
+            "Sid": "SQSResults",
+            "Effect": "Allow",
+            "Action": [
+                "sqs:SendMessage"
+            ],
+            "Resource": "arn:aws:sqs:eu-west-1:911167932273:appway-results"
+        },
+        {
+            "Sid": "S3IncomingRead",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::appway-bridge-prod",
+                "arn:aws:s3:::appway-bridge-prod/incoming/*"
+            ]
+        },
+        {
+            "Sid": "S3ResultsWrite",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::appway-bridge-prod/results/*",
+                "arn:aws:s3:::appway-bridge-prod/failed/*"
+            ]
+        },
+        {
+            "Sid": "S3ResultsRead",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject"
+            ],
+            "Resource": "arn:aws:s3:::appway-bridge-prod/results/*"
+        },
+        {
+            "Sid": "S3ModelWeights",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject"
+            ],
+            "Resource": "arn:aws:s3:::ray-bucket-ai-models/*"
+        },
+        {
+            "Sid": "SNSAlerts",
+            "Effect": "Allow",
+            "Action": [
+                "sns:Publish",
+                "sns:ListTopics",
+                "sns:GetTopicAttributes",
+                "sns:ListSubscriptionsByTopic"
+            ],
+            "Resource": "arn:aws:sns:eu-west-1:911167932273:appway-dlq-alerts"
+        },
+        {
+            "Sid": "CloudWatchAlarms",
+            "Effect": "Allow",
+            "Action": [
+                "cloudwatch:DescribeAlarms",
+                "cloudwatch:PutMetricAlarm",
+                "cloudwatch:PutMetricData"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

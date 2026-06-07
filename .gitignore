@@ -21,6 +21,13 @@ models/
 logs/*.logs
 logs/*.log
 
+# docs subdirs with test images / binary artefacts — never commit these
+docs/examples/
+docs/gold_samples/
+docs/heidelbergh doc/
+docs/heyex2/
+docs/test_results/
+
 # Layout sandbox — kept on disk for reference but never committed.
 # Contains: build_page_templates.py, run.py, sample_data.py and
 # the outputs/ / sample_images/ / ai_inspect/ artefacts.
