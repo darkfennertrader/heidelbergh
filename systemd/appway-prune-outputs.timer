@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune appway local outputs/ nightly at 03:00 UTC
+Documentation=file:///home/ubuntu/appway-backend/docs/reporting.md
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+Unit=appway-prune-outputs.service
+
+[Install]
+WantedBy=timers.target

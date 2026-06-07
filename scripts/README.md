@@ -9,6 +9,7 @@ the **MyopicCNV+ backend** end-to-end.
 | [`inject_job.sh`](./inject_job.sh) | Push one or more `.dcm` files through the pipeline (S3 upload + SQS job + log tail). |
 | [`cleanup_test_jobs.sh`](./cleanup_test_jobs.sh) | Delete every `test-*` artefact from S3, the local `outputs/` dir, and the Windows `AISolutionFolder`. |
 | [`job_timeline.py`](./job_timeline.py) | Print a **cross-system timeline** for a job (HEYEX → S3 → backend → S3 → HEYEX) and append it to `logs/workflow.logs`. |
+| [`appway-prune-outputs.sh`](./appway-prune-outputs.sh) | **Nightly prune** — deletes `outputs/<job>/` folders older than 3 days. Called by `appway-prune-outputs.timer` (03:00 UTC). Logs to `/var/log/appway-prune.log`. |
 
 Typical flow:
 

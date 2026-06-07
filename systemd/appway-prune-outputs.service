@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune local appway outputs/<job-id>/ folders older than 3 days
+Documentation=file:///home/ubuntu/appway-backend/docs/reporting.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/home/ubuntu/appway-backend/scripts/appway-prune-outputs.sh
+StandardOutput=append:/var/log/appway-prune.log
+StandardError=append:/var/log/appway-prune.log
+TimeoutStartSec=300

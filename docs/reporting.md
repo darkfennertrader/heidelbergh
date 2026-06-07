@@ -406,6 +406,28 @@ after the clinical `result.dcm` upload.  The weekly digest streams assets
 
 ---
 
+## Install the nightly prune timer (one-time setup on a new machine)
+
+```bash
+# 1. Copy unit files
+sudo cp /home/ubuntu/appway-backend/systemd/appway-prune-outputs.service \
+        /home/ubuntu/appway-backend/systemd/appway-prune-outputs.timer \
+        /etc/systemd/system/
+
+# 2. Reload and enable
+sudo systemctl daemon-reload
+sudo systemctl enable --now appway-prune-outputs.timer
+
+# 3. Verify
+systemctl list-timers appway-prune-outputs.timer
+```
+
+The prune script lives in the repo at `scripts/appway-prune-outputs.sh` — that is the
+single source of truth.  The service unit's `ExecStart` points at that path so no
+separate `/usr/local/sbin/` copy is needed on a fresh deploy.
+
+---
+
 ## Local outputs/ directory and the nightly prune
 
 `outputs/<job-id>/` on the EC2 instance is a **local operator-inspection copy**
