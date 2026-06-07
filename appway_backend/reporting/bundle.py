@@ -19,8 +19,10 @@ For each report we build one zip archive:
     └── README.txt
 
 Sources:
-  • PNGs + result.pdf  from  /home/ubuntu/appway-backend/outputs/<job-id>/
-  • Anything not found on disk is skipped with a warning.
+  • PNGs + result.pdf  from  s3://<bucket>/results/<job-id>/assets/
+    (uploaded by the worker at step 14b immediately after processing)
+  • Jobs not found in S3 are skipped with a warning (e.g. jobs processed
+    before this feature was deployed).
 
 The zip is streamed directly to a BytesIO buffer — no temp files.
 Then uploaded to:
@@ -34,8 +36,8 @@ import csv
 import io
 import logging
 import zipfile
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 
 import boto3
 
@@ -44,6 +46,7 @@ from .audit import AuditRecord
 
 logger = logging.getLogger(__name__)
 
+# Local outputs root is still used for dry-run previews only.
 _OUTPUTS_ROOT = Path("/home/ubuntu/appway-backend/outputs")
 
 
@@ -59,14 +62,77 @@ def _zip_key(period_end: datetime) -> str:
     return f"{config.REPORT_PREFIX}{period_end.strftime('%Y-%m-%d')}/images.zip"
 
 
-def _add_job_to_zip(
+def _add_job_to_zip_from_s3(
+    zf: zipfile.ZipFile,
+    s3_client,
+    record: AuditRecord,
+    subdir: str,
+) -> int:
+    """
+    Stream result.pdf + all *.png files for one job from S3 into the zip.
+
+    Reads from:  s3://<bucket>/results/<job-id>/assets/
+    Returns the number of files added (0 if the prefix is empty / missing).
+    """
+    assets_prefix = f"results/{record.job_id}/assets/"
+    paginator = s3_client.get_paginator("list_objects_v2")
+
+    added = 0
+    found_any = False
+
+    try:
+        pages = paginator.paginate(Bucket=config.S3_BUCKET, Prefix=assets_prefix)
+        for page in pages:
+            for obj in page.get("Contents", []):
+                found_any = True
+                key = obj["Key"]
+                # Relative path inside the assets prefix, e.g.
+                #   results/<job>/assets/result.pdf          → result.pdf
+                #   results/<job>/assets/<stem>/frame000.png → <stem>/frame000.png
+                relative = key[len(assets_prefix):]
+                if not relative:
+                    continue  # skip directory placeholder
+
+                # Only include result.pdf and *.png files; skip anything else
+                # (e.g. metadata.json — not useful in the weekly email bundle).
+                name = PurePosixPath(relative).name
+                if name != "result.pdf" and not name.endswith(".png"):
+                    continue
+
+                # Flatten PNG paths: all PNGs go directly into the per-job
+                # folder so opening the zip shows: result.pdf + all PNGs
+                # side-by-side (matches previous local-disk behaviour).
+                arcname = f"{subdir}/{name}"
+
+                response = s3_client.get_object(Bucket=config.S3_BUCKET, Key=key)
+                zf.writestr(arcname, response["Body"].read())
+                added += 1
+
+    except Exception:
+        logger.exception(
+            "[%s] Failed to list/download assets from s3://%s/%s — skipping",
+            record.job_id, config.S3_BUCKET, assets_prefix,
+        )
+        return 0
+
+    if not found_any:
+        logger.warning(
+            "[%s] No assets found at s3://%s/%s — job was processed before "
+            "S3-asset upload was deployed, or asset upload failed",
+            record.job_id, config.S3_BUCKET, assets_prefix,
+        )
+
+    return added
+
+
+def _add_job_to_zip_from_disk(
     zf: zipfile.ZipFile,
     record: AuditRecord,
     subdir: str,
 ) -> int:
     """
-    Add result.pdf + all *.png files for one job to the zip.
-    Returns the number of files added.
+    Fallback: read assets from local disk (used by dry-run / manual_report).
+    Mirrors the original local-FS behaviour.
     """
     job_dir = _OUTPUTS_ROOT / record.job_id
     if not job_dir.exists():
@@ -78,7 +144,6 @@ def _add_job_to_zip(
 
     added = 0
 
-    # result.pdf (sits directly in outputs/<job-id>/)
     pdf_path = job_dir / "result.pdf"
     if pdf_path.exists():
         zf.write(pdf_path, arcname=f"{subdir}/result.pdf")
@@ -86,15 +151,7 @@ def _add_job_to_zip(
     else:
         logger.warning("[%s] result.pdf not found at %s", record.job_id, pdf_path)
 
-    # All PNGs (in per-DICOM subdirectories: outputs/<job-id>/<stem>/*.png)
     for png in sorted(job_dir.rglob("*.png")):
-        # Preserve the per-DICOM subdirectory structure inside the zip folder
-        # e.g. outputs/<job>/<dicom-stem>/b_scan_001.png
-        #   → clinical/<folder>/b_scan_001.png  (flatten one level for readability)
-        #   OR
-        #   → clinical/<folder>/<dicom-stem>/b_scan_001.png  (preserve sub-structure)
-        # We choose to flatten: all PNGs go directly into the per-job folder so
-        # opening the folder shows: result.pdf + all PNGs side-by-side.
         arcname = f"{subdir}/{png.name}"
         zf.write(png, arcname=arcname)
         added += 1
@@ -179,19 +236,29 @@ def build_and_upload_bundle(
     """
     Build the images zip, upload it to S3, and return (s3_key, presigned_url).
 
-    dry_run:  if True, save to outputs/_report_preview/images.zip instead of S3
-              and return (local_path_str, None).
+    In normal (non-dry-run) mode assets are streamed directly from
+    s3://<bucket>/results/<job-id>/assets/ — the local outputs/ directory
+    is NOT required.
 
-    Returns (None, None) if the zip would be empty (no outputs dirs found).
+    dry_run:  if True, fall back to reading from the local outputs/ directory
+              (for manual_report.py previews) and save the zip to
+              outputs/_report_preview/images.zip.  Returns (local_path, None).
+
+    Returns (None, None) if the zip would be empty (no assets found).
     """
     buf = io.BytesIO()
     total_files = 0
+
+    s3_client = _s3() if not dry_run else None
 
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         # Clinical analyses
         for rec in clinical_rows:
             folder = f"clinical/{rec.folder_name}"
-            added = _add_job_to_zip(zf, rec, folder)
+            if dry_run:
+                added = _add_job_to_zip_from_disk(zf, rec, folder)
+            else:
+                added = _add_job_to_zip_from_s3(zf, s3_client, rec, folder)
             total_files += added
             logger.debug("[%s] Added %d file(s) to zip under %s", rec.job_id, added, folder)
 
@@ -199,7 +266,10 @@ def build_and_upload_bundle(
         if test_rows:
             for rec in test_rows:
                 folder = f"test/{rec.folder_name}"
-                added = _add_job_to_zip(zf, rec, folder)
+                if dry_run:
+                    added = _add_job_to_zip_from_disk(zf, rec, folder)
+                else:
+                    added = _add_job_to_zip_from_s3(zf, s3_client, rec, folder)
                 total_files += added
 
         # manifest.csv
@@ -225,8 +295,7 @@ def build_and_upload_bundle(
         return str(out_path), None
 
     s3_key = _zip_key(period_end)
-    s3 = _s3()
-    s3.put_object(
+    s3_client.put_object(
         Bucket=config.S3_BUCKET,
         Key=s3_key,
         Body=zip_bytes,
@@ -236,7 +305,7 @@ def build_and_upload_bundle(
 
     # Generate presigned URL
     ttl_seconds = config.REPORT_PRESIGNED_TTL_DAYS * 86400
-    url = s3.generate_presigned_url(
+    url = s3_client.generate_presigned_url(
         "get_object",
         Params={"Bucket": config.S3_BUCKET, "Key": s3_key},
         ExpiresIn=ttl_seconds,

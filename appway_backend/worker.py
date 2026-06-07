@@ -28,7 +28,7 @@ from pathlib import Path
 
 from . import config
 from . import s3_utils, sqs_utils, sns_utils
-from .processor import process
+from .processor import process, OUTPUTS_ROOT
 from .epdf_generator import generate_error_epdf_dcm
 
 
@@ -271,6 +271,30 @@ def _handle_job(msg: dict) -> None:
                 "[%s] STAGE 6/9 upload_done s3_key=%sresult.dcm size_bytes=%d",
                 job_id, result_prefix, _result_bytes,
             )
+
+            # Step 14b — upload report assets (result.pdf + PNGs) to S3 so the
+            # weekly digest can read from S3 instead of local disk.
+            # This is non-fatal: the clinical result.dcm is already in S3.
+            _assets_dir = OUTPUTS_ROOT / job_id
+            if _assets_dir.exists():
+                _assets_prefix = f"{result_prefix}assets/"
+                try:
+                    s3_utils.upload_directory(_assets_dir, _assets_prefix)
+                    logger.info(
+                        "[%s] STAGE 6b/9 assets_uploaded s3_prefix=%s",
+                        job_id, _assets_prefix,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] Report-asset upload failed (non-fatal — weekly digest "
+                        "will skip this job's images)",
+                        job_id,
+                    )
+            else:
+                logger.warning(
+                    "[%s] outputs dir %s not found — no assets uploaded",
+                    job_id, _assets_dir,
+                )
 
             # Step 15 — send result message to appway-results
             sqs_utils.send_result_message(job_id, result_prefix)
