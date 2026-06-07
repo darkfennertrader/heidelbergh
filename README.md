@@ -1,172 +1,270 @@
 # appway-backend
 
-Backend service for **MyopicCNV+** — an AI-powered Myopic Choroidal
-Neovascularisation (mCNV) detection pipeline that processes OCT DICOM
-files and produces a branded, multi-page PDF report.
+> **MyopicCNV+** — AI-powered Myopic Choroidal Neovascularisation (mCNV) detection backend  
+> Running on AWS (EC2 + SQS + S3 + SES) · Python 3.13 · YOLO v8 · ReportLab
 
 ---
 
-## PDF Report Generation
+## What it does
 
-### Overview
+Heidelberg Engineering's **AppWay bridge** drops OCT DICOM files into an S3 bucket and enqueues a job message. This backend:
 
-The report is generated with a **template-overlay** strategy that gives
-pixel-faithful reproduction of the designer's artwork without having to
-re-implement gradients, drop-shadows, rounded-corner tabs, and logos
-from scratch in a drawing library.
-
-```
-pdf_sandbox/designer_source/Myopic2_ver_b.ai  (designer source — internally a 6-page PDF, gitignored)
-        │
-        │  appway_backend/report/templates.py  (run once, or on .ai changes)
-        │  → redact all text spans with PyMuPDF
-        │  → render each page to a 300-DPI PNG via PyMuPDF
-        │  → post-process table page in PIL (shift card up under logo)
-        ▼
-appway_backend/report/assets/
-  page_template_summary.png   ← page 1 chrome (logo, gradients, footer band)
-  page_template_gallery.png   ← page 2 chrome (image slots, teal tabs, footer)
-  page_template_table.png     ← page 3 chrome (table card, teal tab, footer)
-        │
-        │  appway_backend/report/generator.py  build_pdf(job, out_path)
-        │  → stamp template PNG as background (ReportLab)
-        │  → overlay all dynamic text at designer coordinates
-        │    (job ID, verdict card, filenames, confidence, bboxes …)
-        │  → rasterise verdict card as PIL gradient PNG, stamp in PDF
-        ▼
-output PDF  (A4, Montserrat font, pixel-faithful layout)
-```
-
-### Pages
-
-| Preview file | Content |
-|---|---|
-| `verdict_page.png` | Summary: job info, AI verdict card, input files, processing status, app description |
-| `image_page.png` | Gallery: up to 2 OCT images with red bbox overlay + confidence/bbox captions |
-| `table_page.png` | Per-image results table: filename, ACTIVE/INACTIVE, confidence, bbox coordinates |
-
-### Key design decisions
-
-**Text redaction + re-draw**
-The designer's `.ai` has every text span baked in (including sample job
-IDs, filenames, and table values). We redact all text from each source
-page with `page.add_redact_annot` / `page.apply_redactions` in PyMuPDF,
-leaving only the graphical chrome. The generator then redraws every text
-element at the exact `(x, y, font, size, color)` triples extracted from
-the `.ai` via `page.get_text("dict")` — so the output is visually
-identical to what the designer exported.
-
-**Coordinate system**
-The designer (and PyMuPDF) uses a top-down origin; ReportLab uses a
-bottom-up origin. The helpers `_y(y_topdown)` and `_yb(y_topdown, size)`
-handle the flip. `_yb` additionally applies the Montserrat cap-ascent
-ratio (`_ASCENT_RATIO = 0.968`) so text baselines land at the designer's
-bbox top exactly.
-
-**Verdict card**
-ReportLab cannot render horizontal gradients or Gaussian-blurred drop
-shadows. We rasterise the card at 4× oversample in PIL (rounded-rect
-mask → gradient fill → blurred shadow → composite → downsample with
-LANCZOS) and stamp the transparent PNG into the PDF. Red gradient for
-ACTIVE (`#e82724 → #b81d20`), blue gradient for INACTIVE
-(`#00a3d0 → #0070a8`).
-
-**Table page card shift**
-The designer centres the PER-IMAGE RESULTS card vertically (~100 pt gap
-below the logo). The product spec pins the card right under the logo.
-`build_page_templates.py` post-processes the rendered PNG with PIL:
-it crops the inner x-band of the card (skipping the side gradient bars)
-within the Y-range `[215, 755] pt` and pastes it back shifted 83 pt
-upward, filling the vacated strip with white. `pdf_generator.py` subtracts
-the same 83 pt from all card-area y-coords (`_P5_SHIFT = 83.0`).
+1. **Polls** an SQS queue for jobs (long-poll, infinite loop)
+2. **Downloads** the DICOM files from S3
+3. **Runs YOLO v8 inference** to detect mCNV lesions
+4. **Generates a branded 3-page PDF report** (verdict, image gallery, per-image results table)
+5. **Packages** the PDF into an AppWay-compliant ePDF DICOM (`result.dcm`)
+6. **Uploads** the result back to S3 and notifies the AppWay result queue
+7. **Uploads report assets** (PDF + PNG images) to S3 for the weekly digest
+8. **Emails a weekly digest** every Sunday 06:00 UTC with statistics + presigned download link
 
 ---
 
-## Packages Used
+## Architecture overview
 
-| Package | Import name | Purpose |
-|---|---|---|
-| **ReportLab** | `reportlab` | Draw text, stamp images, produce the output PDF |
-| **PyMuPDF** | `fitz` | Open the `.ai` source, redact text spans, render 300-DPI template PNGs, render preview PNGs from the output PDF |
-| **Pillow** | `PIL` | Rasterise the verdict card (gradient + shadow); annotate OCT images with red bbox + confidence chip; post-process template PNG (table card shift) |
-| **Montserrat TTF** | `appway_backend/report/assets/*.ttf` | Designer typeface (ExtraBold, Bold, SemiBold, Regular, Light); registered with ReportLab at runtime |
+```
+Heidelberg HEYEX
+     │  (AppWay bridge)
+     ▼
+S3: incoming/<job-id>/*.dcm
+     │
+     ▼
+SQS: appway-jobs
+     │
+     ▼
+┌─────────────────────────────────────────────┐
+│  appway-worker.service  (this repo)         │
+│                                             │
+│  1. download DICOMs from S3                 │
+│  2. extract PNGs → run YOLO inference       │
+│  3. generate branded PDF → wrap as ePDF DCM │
+│  4. upload result.dcm → S3 results/<job>/   │
+│  5. upload assets (PDF+PNGs) → S3 assets/   │
+│  6. notify appway-results SQS queue         │
+│  7. write audit record to JSONL             │
+└─────────────────────────────────────────────┘
+     │
+     ▼
+SQS: appway-results  →  Heidelberg AppWay picks up result.dcm
+S3:  results/<job>/result.dcm
 
-All Python dependencies are declared in `pyproject.toml` and locked in
-`uv.lock`. Install with `uv sync`.
+Weekly (Sunday 06:00 UTC):
+┌─────────────────────────────────────────────┐
+│  appway-weekly-report.service               │
+│                                             │
+│  1. read audit log for past 7 days          │
+│  2. stream assets from S3 → build zip       │
+│  3. generate digest PDF (stats + tables)    │
+│  4. email via SES: PDF attached,            │
+│     images.zip linked (presigned URL)       │
+└─────────────────────────────────────────────┘
+```
 
 ---
 
-## Developer Workflow
-
-### 1 — Rebuild template PNGs (only needed when `.ai` changes)
-
-```bash
-uv run python -m appway_backend.report.templates
-```
-
-Outputs `appway_backend/report/assets/page_template_{summary,gallery,table}.png`.
-
-### 2 — Iterate on the layout
-
-Edit `appway_backend/report/generator.py`. Coordinate constants live in
-the `P0`, `P_GAL`, and `P5` dicts. Font helpers are at the top of the
-file. The module is fully self-contained — changes here are immediately
-reflected when the production worker calls `generate_epdf_dcm()`.
-
-> **Full procedure** — coordinate system, what to edit for each concern,
-> what not to touch, and the visual-comparison workflow — is documented
-> in [`docs/pdf-layout.md`](docs/pdf-layout.md).
-
-### 3 — Generate a preview
-
-```bash
-uv run python -m appway_backend.report.preview
-```
-
-Outputs:
-- `pdf_sandbox/outputs/preview.pdf`
-- `pdf_sandbox/outputs/previews/verdict_page.png`
-- `pdf_sandbox/outputs/previews/image_page.png`
-- `pdf_sandbox/outputs/previews/table_page.png`
-
-Switch between `STATIC_JOB` (wireframe placeholders) and `MOCK_JOB`
-(realistic data) by editing the import in
-`appway_backend/report/preview.py` for different preview modes.
-
-### 4 — Production entry point
-
-```python
-# High-level: use the DICOM wrapper (normal production path)
-from appway_backend.epdf_generator import generate_epdf_dcm
-
-# Low-level: call the PDF body generator directly (e.g. for tests)
-from appway_backend.pdf_report import build_pdf, ReportJob, InputFileInfo, PerImageResult
-```
-
-`build_pdf(job: ReportJob, out_path: Path) -> Path`
-
----
-
-## Project Layout
+## Repository layout
 
 ```
 appway_backend/
-  pdf_report.py             Public API shim — import build_pdf / dataclasses from here
-  epdf_generator.py         DICOM ePDF wrapper (calls pdf_report.build_pdf internally)
-  report/
-    __init__.py             Re-exports from generator.py
-    generator.py            PDF layout engine (build_pdf + P0/P_GAL/P5 coords + helpers)
-    templates.py            Rebuild template PNGs from .ai source (reads pdf_sandbox/designer_source/)
-    sample_data.py          STATIC_JOB / MOCK_JOB sandbox presets
-    preview.py              Sandbox preview runner (python -m appway_backend.report.preview)
-    assets/                 Runtime assets — template PNGs + Montserrat TTFs (committed alongside source)
-  processor.py              DICOM → PNG extraction + inference orchestration
-  worker.py                 Infinite SQS poll loop
-  inference.py              YOLO singleton + run_inference()
-  config.py                 .env / env-var loader
-  s3_utils.py / sqs_utils.py / sns_utils.py
-pdf_sandbox/                Layout sandbox (gitignored — kept on disk for reference)
-  designer_source/          Designer's original .ai files, .otf font variants, reference PDFs
-  outputs/previews/         Last generated preview PNGs (verdict_page, image_page, table_page)
-scripts/                    AWS / deployment helpers
+  config.py            — env-var config (loaded from .env)
+  worker.py            — main SQS poll loop + job orchestration
+  processor.py         — DICOM → PNG extraction + inference + audit
+  inference.py         — YOLO v8 inference wrapper
+  epdf_generator.py    — ePDF DICOM builder (result + error paths)
+  pdf_report.py        — PDF content renderer
+  s3_utils.py          — S3 download / upload helpers
+  sqs_utils.py         — SQS receive / delete / heartbeat helpers
+  sns_utils.py         — SNS operator-alert publisher
+  report/              — PDF template + generator (ReportLab + PyMuPDF)
+    generator.py       — build_pdf(job, out_path)
+    templates.py       — render designer .ai to PNG chrome (run once)
+    assets/            — Montserrat fonts, page-template PNGs, icons
+  reporting/           — Weekly digest subsystem
+    weekly_report.py   — entry point (run by systemd timer)
+    core.py            — orchestrate: audit → pdf → bundle → email
+    audit.py           — read / write JSONL audit log
+    bundle.py          — build images.zip from S3 assets
+    pdf.py             — generate digest PDF report
+    email.py           — send via SES (raw MIME)
+    state.py           — last-run state file (idempotency)
+    manual_report.py   — CLI for ad-hoc reports + dry-run previews
+
+docs/                  — Operator + developer runbooks
+scripts/               — Helper scripts (inject test jobs, cleanup, RDP, etc.)
+systemd/               — Unit files (worker + weekly report + prune timer)
+logs/                  — Log directory (worker.log, workflow.logs)
+main.py                — Entry point (calls worker.main())
+pyproject.toml         — Dependencies (uv)
 ```
+
+---
+
+## S3 bucket layout
+
+```
+appway-bridge-prod/
+  incoming/<job-id>/          ← DICOM input from Heidelberg AppWay
+  results/<job-id>/
+    result.dcm                ← ePDF DICOM (AppWay contract artefact)
+    assets/
+      result.pdf              ← Human-readable PDF report
+      <stem>/<frame>.png      ← Extracted B-scan images
+  failed/<job-id>/error.txt   ← Failure artefact (ops visibility)
+  processed/<job-id>/         ← Moved by AppWay bridge after pickup
+  reports/<YYYY-MM-DD>/
+    images.zip                ← Weekly bundle (presigned URL in digest email)
+```
+
+---
+
+## Managed systemd services
+
+| Unit | What | Schedule |
+|---|---|---|
+| `appway-worker.service` | Main worker — SQS poll loop | Always running (`Restart=on-failure`) |
+| `appway-weekly-report.timer` | Weekly digest email | Sunday 06:00 UTC (`Persistent=true`) |
+| `appway-prune-outputs.timer` | Prune local `outputs/<job>/` | Nightly 03:00 UTC (`Persistent=true`) |
+
+Quick commands:
+
+```bash
+# Worker
+sudo systemctl status appway-worker.service
+sudo journalctl -u appway-worker.service -f
+
+# Weekly report (run manually)
+sudo systemctl start appway-weekly-report.service
+tail -f /var/log/appway-weekly-report.log
+
+# Prune (run manually)
+sudo systemctl start appway-prune-outputs.service
+cat /var/log/appway-prune.log
+
+# All timers
+systemctl list-timers --no-pager | grep appway
+```
+
+---
+
+## Environment variables (`.env`)
+
+| Variable | Description |
+|---|---|
+| `AWS_REGION` | AWS region (e.g. `eu-west-1`) |
+| `S3_BUCKET` | S3 bucket name |
+| `JOBS_QUEUE_URL` | SQS URL for incoming jobs (`appway-jobs`) |
+| `RESULTS_QUEUE_URL` | SQS URL for results (`appway-results`) |
+| `ERROR_TOPIC_ARN` | SNS topic ARN for operator alerts |
+| `WORK_DIR` | Local scratch dir for job processing |
+| `CLINICAL_TRIAL_PROTOCOL_VERSION` | Version string stamped on reports |
+| `REPORT_RECIPIENTS` | Comma-separated email list for weekly digest |
+
+---
+
+## Logs
+
+| File | Content |
+|---|---|
+| `/var/log/appway-worker.log` | Worker stdout/stderr (all job activity) |
+| `/var/log/appway-weekly-report.log` | Weekly digest runs |
+| `/var/log/appway-prune.log` | Nightly local-output prune |
+
+All three are rotated weekly, 8 rotations kept, compressed (`/etc/logrotate.d/appway`).
+
+---
+
+## PDF report
+
+The 3-page branded report uses a **template-overlay** strategy:
+
+1. The designer's `.ai` source is stripped of all text (PyMuPDF redaction) to produce page-chrome PNGs (`assets/page_template_*.png`)
+2. `report/generator.py` stamps the chrome as background (ReportLab) then redraws all dynamic content at the exact designer coordinates
+3. The verdict card gradient is rasterised in PIL at 4× oversample then stamped as a transparent PNG
+
+See [`docs/pdf-layout.md`](docs/pdf-layout.md) for the full coordinate reference.
+
+---
+
+## Weekly reporting digest
+
+Every Sunday at 06:00 UTC the digest:
+
+- Reads the past 7 days from the JSONL audit log
+- Builds a summary PDF (Table A: per-job, Table B: cumulative, Table C: test jobs)
+- Streams per-job assets (PDF + PNGs) directly from S3 into a zip
+- Uploads the zip to `s3://<bucket>/reports/<date>/images.zip`
+- Emails via SES: digest PDF attached, presigned download link in HTML body
+
+See [`docs/reporting.md`](docs/reporting.md) for the operator runbook.
+
+---
+
+## Running a manual report
+
+```bash
+cd /home/ubuntu/appway-backend
+
+# Dry-run (no email — saves PDF + zip to outputs/_report_preview/)
+uv run python -m appway_backend.reporting.manual_report
+
+# Real send (uses REPORT_RECIPIENTS from .env)
+uv run python -m appway_backend.reporting.manual_report --send
+
+# Custom date range
+uv run python -m appway_backend.reporting.manual_report \
+    --from 2026-06-01 --to 2026-06-07 --send
+```
+
+---
+
+## Injecting a test job
+
+```bash
+# Inject a synthetic test DICOM job into the SQS queue
+bash scripts/inject_job.sh
+
+# Clean up test job outputs from S3 + local outputs/
+bash scripts/cleanup_test_jobs.sh
+```
+
+---
+
+## IAM
+
+The EC2 instance runs as `EC2AppWayBackendRole` (no embedded keys). Required permissions are documented in:
+
+- [`docs/iam-ec2apwaybackendrole-policy.json`](docs/iam-ec2apwaybackendrole-policy.json) — worker + S3 + SQS + SNS
+- [`docs/iam-weekly-report-policy.json`](docs/iam-weekly-report-policy.json) — SES send permissions
+
+---
+
+## Development
+
+```bash
+# Install dependencies
+uv sync
+
+# Run worker locally (needs .env with valid AWS creds)
+uv run python main.py
+
+# Generate PDF preview (no AWS needed)
+uv run python -m appway_backend.report.preview
+```
+
+---
+
+## Docs index
+
+| Document | Audience |
+|---|---|
+| [`docs/workflow.md`](docs/workflow.md) | End-to-end system workflow |
+| [`docs/backend.md`](docs/backend.md) | Backend developer reference |
+| [`docs/reporting.md`](docs/reporting.md) | Weekly digest operator runbook |
+| [`docs/appway.md`](docs/appway.md) | AppWay integration notes |
+| [`docs/appway-windows-ec2.md`](docs/appway-windows-ec2.md) | Windows EC2 setup |
+| [`docs/heyex-daily.md`](docs/heyex-daily.md) | Daily HEYEX operator procedure |
+| [`docs/heidelberg-remote-session.md`](docs/heidelberg-remote-session.md) | Remote session setup |
+| [`docs/klaus-procmon-runbook.md`](docs/klaus-procmon-runbook.md) | Klaus Process Monitor runbook |
+| [`docs/pdf-layout.md`](docs/pdf-layout.md) | PDF coordinate reference |
+| [`docs/next-steps.md`](docs/next-steps.md) | Planned improvements |
+| [`scripts/README.md`](scripts/README.md) | Scripts reference |

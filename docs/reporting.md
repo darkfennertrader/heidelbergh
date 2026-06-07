@@ -24,16 +24,23 @@
 
 ### 1 · Every time a job completes (automatic — no action needed)
 
-When the worker finishes processing a DICOM study, `processor.py` automatically
-writes a small audit record to S3:
+When the worker finishes processing a DICOM study it automatically:
 
-```
-s3://appway-bridge-prod/audit/YYYY/MM/DD/<job-id>.json
-```
+1. Writes an audit record to S3:
+   ```
+   s3://appway-bridge-prod/audit/YYYY/MM/DD/<job-id>.json
+   ```
+   Each record contains: `job_id`, `completed_at`, `accession_number`,
+   `study_instance_uid`, `n_images`, `n_positive`, `n_negative`, `verdict`,
+   `processing_time_s`, `is_test`.
 
-Each record contains: `job_id`, `completed_at`, `accession_number`,
-`study_instance_uid`, `n_images`, `n_positive`, `n_negative`, `verdict`,
-`processing_time_s`, `is_test`.
+2. Uploads report assets to S3 alongside the clinical `result.dcm`:
+   ```
+   s3://appway-bridge-prod/results/<job-id>/assets/result.pdf
+   s3://appway-bridge-prod/results/<job-id>/assets/<stem>/<frame>.png
+   ```
+   These are streamed directly into the weekly `images.zip` — the local
+   `outputs/<job-id>/` directory is **not** required by the digest.
 
 **`is_test`** is `true` when `job_id` starts with `test-` (jobs injected via
 `scripts/inject_job.sh`).  Clinical jobs (`final-…`) always have `is_test=false`.
@@ -374,28 +381,53 @@ uv run python -m appway_backend.reporting.manual_report \
 ```
 s3://appway-bridge-prod/
 ├── audit/
-│   ├── 2026/05/22/final-20260522_<uuid>.json   ← per-job audit record
-│   ├── 2026/05/23/final-20260523_<uuid>.json
+│   ├── 2026/05/22/final-20260522_<uuid>.json     ← per-job audit record
 │   └── ...
+├── results/
+│   └── <job-id>/
+│       ├── result.dcm                             ← ePDF DICOM (AppWay contract)
+│       └── assets/
+│           ├── result.pdf                         ← human-readable PDF report
+│           └── <dicom-stem>/
+│               ├── frame000.png                   ← extracted B-scan images
+│               └── ...
+├── failed/<job-id>/error.txt                      ← failure artefact (ops visibility)
 ├── reports/
-│   ├── state.json                               ← last_period_end + history
+│   ├── state.json                                 ← last_period_end + history
 │   ├── 2026-05-28/
-│   │   ├── report.pdf                           ← official weekly digest PDF
-│   │   └── images.zip                           ← image bundle (7-day presigned URL)
+│   │   ├── report.pdf                             ← official weekly digest PDF
+│   │   └── images.zip                             ← image bundle (7-day presigned URL)
 │   └── ...
 ```
 
-### Lifecycle policy (recommended)
+`results/<job-id>/assets/` is written by the worker at step 14b immediately
+after the clinical `result.dcm` upload.  The weekly digest streams assets
+**directly from S3** — the EC2 local `outputs/` directory is not involved.
 
-To avoid unbounded storage growth, add a lifecycle rule on `reports/*/images.zip`
-to expire after 90 days.  Do this in the AWS console:
+---
 
-1. S3 → `appway-bridge-prod` → Management → Lifecycle rules → Create rule
-2. Prefix: `reports/`  |  Filter: suffix `images.zip`
-3. Action: Expire after 90 days
+## Local outputs/ directory and the nightly prune
 
-The `report.pdf` files are small (~200 KB) and worth keeping indefinitely for
-audit purposes.
+`outputs/<job-id>/` on the EC2 instance is a **local operator-inspection copy**
+written by the worker for short-term debugging.  It is pruned automatically:
+
+| Timer | Schedule | Retention |
+|---|---|---|
+| `appway-prune-outputs.timer` | Nightly 03:00 UTC | 3 days |
+
+```bash
+# Prune status
+systemctl list-timers appway-prune-outputs.timer
+
+# Force a prune right now
+sudo systemctl start appway-prune-outputs.service
+cat /var/log/appway-prune.log
+```
+
+The prune script is `/usr/local/sbin/appway-prune-outputs.sh` — it logs what
+it deletes with size in MB so you can track disk usage.
+
+> The weekly digest is **not affected** by pruning — it reads from S3, not from `outputs/`.
 
 ---
 
