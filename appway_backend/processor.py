@@ -38,6 +38,8 @@ already carry meaningful names on disk and no additional patching is needed.
 import json
 import logging
 import shutil
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -480,4 +482,49 @@ def process(job_id: str, input_dir: Path, output_dir: Path) -> None:
         logger.warning("[%s] Could not save human-readable PDF: %s", job_id, e)
 
     logger.info("[%s] Processor complete. Job outputs: %s", job_id, job_outputs_dir)
+
+    # --- Write audit record for reporting digest --------------------------
+    # Idempotent: skipped silently if the S3 key already exists.
+    # Never raises — audit failure must not affect the main result flow.
+    try:
+        from .reporting.audit import write_audit_for_job
+
+        # Extract DICOM-level identifiers from the first DICOM file found.
+        # We do a lightweight re-scan of the input dir here (no pixel data).
+        accession_number: str | None = None
+        study_instance_uid: str | None = None
+        for src in sorted(input_dir.rglob("*.dcm")):
+            try:
+                _ds = pydicom.dcmread(str(src), stop_before_pixels=True)
+                accession_number = str(getattr(_ds, "AccessionNumber", "") or "").strip() or None
+                study_instance_uid = str(getattr(_ds, "StudyInstanceUID", "") or "").strip() or None
+                break
+            except Exception:
+                pass
+
+        n_images   = len(png_paths)
+        n_positive = 0
+        n_negative = 0
+        verdict    = "Unknown"
+        proc_time  = 0.0
+        if inference_result:
+            verdict    = inference_result.get("verdict", "Unknown")
+            proc_time  = float(inference_result.get("processing_time", 0.0))
+            per_image  = inference_result.get("per_image") or []
+            n_positive = sum(1 for img in per_image if img.get("pred") == 1)
+            n_negative = sum(1 for img in per_image if img.get("pred") == 0)
+
+        write_audit_for_job(
+            job_id=job_id,
+            completed_at=datetime.now(timezone.utc),
+            accession_number=accession_number,
+            study_instance_uid=study_instance_uid,
+            n_images=n_images,
+            n_positive=n_positive,
+            n_negative=n_negative,
+            verdict=verdict,
+            processing_time_s=proc_time,
+        )
+    except Exception:
+        logger.exception("[%s] Audit record write failed — non-fatal", job_id)
 

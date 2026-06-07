@@ -1,0 +1,17 @@
+[Unit]
+Description=Trigger the mCNV+ weekly reporting digest every Sunday at 06:00 UTC
+Documentation=file:///home/ubuntu/appway-backend/docs/reporting.md
+
+[Timer]
+# Fire every Sunday at 06:00 UTC.
+OnCalendar=Sun 06:00 UTC
+# If the machine was off when the timer would have fired, run it as soon
+# as the instance is back online (handles reboots / weekend downtime).
+Persistent=true
+# Randomise the start time by up to 60 s to avoid thundering-herd if
+# multiple instances are ever added.
+RandomizedDelaySec=60
+Unit=appway-weekly-report.service
+
+[Install]
+WantedBy=timers.target

@@ -88,3 +88,41 @@ TRAIN_IMAGE_HEIGHT: int = int(os.getenv("TRAIN_IMAGE_HEIGHT", "596"))
 # change. Use semver notation (e.g. 1.0.0, 1.1.0, 2.0.0); the value must
 # be a valid DICOM LO string (≤ 64 chars, no backslashes or control chars).
 CLINICAL_TRIAL_PROTOCOL_VERSION: str = os.getenv("CLINICAL_TRIAL_PROTOCOL_VERSION", "1.0.0")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Weekly reporting digest
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Comma-separated list of recipient email addresses for the weekly digest.
+# Must be verified in SES (or SES must be out of sandbox for arbitrary addresses).
+REPORT_RECIPIENTS: list[str] = [
+    a.strip()
+    for a in os.getenv("REPORT_RECIPIENTS", "").split(",")
+    if a.strip()
+]
+
+# Verified SES sender identity (From: address).
+REPORT_FROM: str = os.getenv("REPORT_FROM", "darkfenner69@gmail.com")
+
+# How long the per-period images.zip presigned URL is valid for.
+REPORT_PRESIGNED_TTL_DAYS: int = int(os.getenv("REPORT_PRESIGNED_TTL_DAYS", "7"))
+
+# S3 prefix where per-job audit JSONs are stored.
+# Full path: s3://<S3_BUCKET>/<AUDIT_PREFIX><YYYY>/<MM>/<DD>/<job-id>.json
+AUDIT_PREFIX: str = os.getenv("AUDIT_PREFIX", "audit/")
+
+# S3 prefix where generated report PDFs and image zips are stored.
+# Full path: s3://<S3_BUCKET>/<REPORT_PREFIX><YYYY-MM-DD>/report.pdf
+#                                                          <YYYY-MM-DD>/images.zip
+REPORT_PREFIX: str = os.getenv("REPORT_PREFIX", "reports/")
+
+# S3 key for the persistent reporting state (last period end timestamp + history).
+REPORT_STATE_KEY: str = os.getenv("REPORT_STATE_KEY", "reports/state.json")
+
+# Subject prefix for outgoing report emails.
+REPORT_SUBJECT_PREFIX: str = os.getenv("REPORT_SUBJECT_PREFIX", "mCNV+ reporting at")
+
+# job_id prefix convention for test jobs (set by inject_job.sh --job-id test-...).
+# Any audit JSON whose job_id starts with this value is treated as a test and
+# excluded from the official weekly report (but shown in manual_report by default).
+REPORT_TEST_JOB_PREFIX: str = os.getenv("REPORT_TEST_JOB_PREFIX", "test-")

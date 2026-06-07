@@ -209,7 +209,11 @@ def _build_pdf_bytes(
             bbox = list(bbox_raw) if bbox_raw else []
             # Resolve full on-disk path for positive images so the
             # gallery page can stamp the annotated OCT frame.
-            image_path = _find_png(fname, png_dirs) if pred == 1 else None
+            # Note: processor.py may have patched fname to a display name
+            # (e.g. "bertipagliap012.jpeg") — the on-disk file is always
+            # a PNG named after the original stem, so look up <stem>.png.
+            png_lookup = Path(fname).stem + ".png"
+            image_path = _find_png(png_lookup, png_dirs) if pred == 1 else None
             per_image.append(PerImageResult(
                 filename=fname,          # full filename, no shortening
                 pred=pred,

@@ -1,0 +1,22 @@
+[Unit]
+Description=mCNV+ weekly reporting digest
+Documentation=file:///home/ubuntu/appway-backend/docs/reporting.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/appway-backend
+# Load the project .env so REPORT_RECIPIENTS, REPORT_FROM, AWS keys etc. are available
+EnvironmentFile=-/home/ubuntu/appway-backend/.env
+ExecStart=/home/ubuntu/appway-backend/scripts/run-weekly-report.sh
+StandardOutput=append:/var/log/appway-weekly-report.log
+StandardError=append:/var/log/appway-weekly-report.log
+# Give up to 10 minutes for the report + email (generous for large periods)
+TimeoutStartSec=600
+# Restart on failure — but the timer's Persistent=true handles the "missed week" case
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
