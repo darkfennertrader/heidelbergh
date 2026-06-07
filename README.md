@@ -119,11 +119,13 @@ appway-bridge-prod/
 
 ## Managed systemd services
 
-| Unit | What | Schedule |
+| Unit file | What | Schedule |
 |---|---|---|
 | `appway-worker.service` | Main worker — SQS poll loop | Always running (`Restart=on-failure`) |
-| `appway-weekly-report.timer` | Weekly digest email | Sunday 06:00 UTC (`Persistent=true`) |
-| `appway-prune-outputs.timer` | Prune local `outputs/<job>/` | Nightly 03:00 UTC (`Persistent=true`) |
+| `appway-weekly-report.service` | Weekly digest (oneshot, called by timer) | — |
+| `appway-weekly-report.timer` | Fires the weekly digest | Sunday 06:00 UTC (`Persistent=true`) |
+| `appway-prune-outputs.service` | Local outputs prune (oneshot, called by timer) | — |
+| `appway-prune-outputs.timer` | Fires the nightly prune | Nightly 03:00 UTC (`Persistent=true`) |
 
 Quick commands:
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=AppWay Backend Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/appway-backend
+ExecStart=/home/ubuntu/.local/bin/uv run python main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/appway-worker.log
+StandardError=append:/var/log/appway-worker.log
+SyslogIdentifier=appway-worker
+
+[Install]
+WantedBy=multi-user.target
