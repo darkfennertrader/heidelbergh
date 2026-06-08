@@ -1,0 +1,339 @@
+/* ── AppWay Feedback · style.css ── */
+
+:root {
+    --blue: #003478;
+    --blue-mid: #0055aa;
+    --blue-light: #e8eef7;
+    --green: #1a7f4e;
+    --red: #c0392b;
+    --grey: #f5f6f8;
+    --text: #1c2533;
+    --muted: #6b7280;
+    --border: #d1d9e6;
+    --radius: 8px;
+    --shadow: 0 4px 24px rgba(0, 52, 120, .10);
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html {
+    font-size: 16px;
+}
+
+body {
+    font-family: var(--font);
+    background: var(--grey);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ── Header ── */
+header {
+    background: #ffffff;
+    border-bottom: 2px solid var(--blue);
+    padding: 10px 24px;
+}
+
+.header-inner {
+    /* full width — logo pinned far left, Heidelberg text centered */
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    max-width: 100%;
+}
+
+.header-logo {
+    height: 38px;
+    width: auto;
+    display: block;
+    flex-shrink: 0;
+}
+
+.header-divider {
+    display: none;
+}
+
+.header-app {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    color: var(--blue);
+    white-space: nowrap;
+    /* push to absolute center by compensating for logo width */
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+/* make header-inner a positioning context */
+header {
+    position: relative;
+}
+
+/* ── Main ── */
+main {
+    flex: 1;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 16px 56px;
+}
+
+.card {
+    background: #fff;
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 40px 40px 36px;
+    width: 100%;
+    max-width: 680px;
+}
+
+.card h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--blue);
+    margin-bottom: 10px;
+}
+
+.intro {
+    font-size: 14px;
+    color: var(--muted);
+    margin-bottom: 28px;
+    line-height: 1.55;
+}
+
+/* ── Form layout ── */
+.form-row {
+    display: flex;
+    gap: 20px;
+}
+
+.form-row.two-col>.form-group {
+    flex: 1 1 0;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 20px;
+}
+
+label {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: var(--text);
+}
+
+.req {
+    color: var(--red);
+    font-weight: 700;
+}
+
+.opt {
+    color: var(--muted);
+    font-weight: 400;
+}
+
+input[type="text"],
+input[type="email"],
+input[type="tel"],
+textarea {
+    border: 1.5px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 12px;
+    font-size: 14px;
+    font-family: var(--font);
+    color: var(--text);
+    background: #fff;
+    transition: border-color .15s, box-shadow .15s;
+    width: 100%;
+    outline: none;
+}
+
+input:focus,
+textarea:focus {
+    border-color: var(--blue-mid);
+    box-shadow: 0 0 0 3px rgba(0, 85, 170, .12);
+}
+
+input.invalid,
+textarea.invalid {
+    border-color: var(--red);
+}
+
+textarea {
+    resize: vertical;
+    min-height: 130px;
+}
+
+.char-count {
+    font-size: 11px;
+    color: var(--muted);
+    text-align: right;
+    margin-top: 4px;
+}
+
+.err {
+    font-size: 12px;
+    color: var(--red);
+    margin-top: 4px;
+    min-height: 16px;
+}
+
+/* ── Star rating (RTL trick) ── */
+.stars {
+    display: flex;
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    gap: 4px;
+    margin-top: 2px;
+}
+
+.stars input {
+    display: none;
+}
+
+.stars label {
+    font-size: 32px;
+    color: #ccc;
+    cursor: pointer;
+    transition: color .1s;
+    margin-bottom: 0;
+    font-weight: 400;
+}
+
+.stars input:checked~label,
+.stars label:hover,
+.stars label:hover~label {
+    color: #f5a623;
+}
+
+/* ── Alerts ── */
+.alert {
+    border-radius: 6px;
+    padding: 12px 16px;
+    font-size: 13px;
+    margin-bottom: 20px;
+    line-height: 1.5;
+}
+
+.alert-error {
+    background: #fdf0ef;
+    border: 1px solid #f5c6c2;
+    color: var(--red);
+}
+
+/* ── Submit button ── */
+button[type="submit"] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    background: var(--blue);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 12px 28px;
+    font-size: 15px;
+    font-weight: 600;
+    font-family: var(--font);
+    cursor: pointer;
+    transition: background .15s, opacity .15s;
+    min-width: 160px;
+}
+
+button[type="submit"]:hover:not(:disabled) {
+    background: var(--blue-mid);
+}
+
+button[type="submit"]:disabled {
+    opacity: .65;
+    cursor: not-allowed;
+}
+
+/* spinner */
+.spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid rgba(255, 255, 255, .4);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* ── Success panel ── */
+.success-panel {
+    text-align: center;
+    padding: 32px 16px;
+}
+
+.success-icon {
+    width: 64px;
+    height: 64px;
+    background: var(--green);
+    color: #fff;
+    border-radius: 50%;
+    font-size: 32px;
+    line-height: 64px;
+    margin: 0 auto 20px;
+}
+
+.success-panel h2 {
+    font-size: 22px;
+    color: var(--green);
+    margin-bottom: 10px;
+}
+
+.success-panel p {
+    font-size: 15px;
+    color: var(--muted);
+}
+
+/* ── Footer ── */
+footer {
+    text-align: center;
+    padding: 18px 16px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+footer a {
+    color: var(--blue);
+    text-decoration: none;
+}
+
+footer a:hover {
+    text-decoration: underline;
+}
+
+/* ── Responsive ── */
+@media (max-width: 520px) {
+    .card {
+        padding: 28px 20px 24px;
+    }
+
+    .form-row.two-col {
+        flex-direction: column;
+        gap: 0;
+    }
+
+    .stars label {
+        font-size: 28px;
+    }
+}

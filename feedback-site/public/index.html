@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AppWay – Clinician Feedback</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+    <header>
+        <div class="header-inner">
+            <img src="logo.png" alt="mCNV+" class="header-logo" />
+            <div class="header-divider"></div>
+            <span class="header-app">Heidelberg</span>
+        </div>
+    </header>
+
+    <main>
+        <div class="card">
+            <h1>Clinician Feedback</h1>
+            <!-- honeypot: bots fill this, humans don't -->
+            <form id="feedbackForm" novalidate>
+                <input type="text" name="website" tabindex="-1" autocomplete="off" style="display:none"
+                    aria-hidden="true" />
+
+                <div class="form-row two-col">
+                    <div class="form-group">
+                        <label for="first_name">First name <span class="req">*</span></label>
+                        <input type="text" id="first_name" name="first_name" maxlength="80" autocomplete="given-name"
+                            required />
+                        <span class="err" id="err_first_name"></span>
+                    </div>
+                    <div class="form-group">
+                        <label for="last_name">Surname <span class="req">*</span></label>
+                        <input type="text" id="last_name" name="last_name" maxlength="80" autocomplete="family-name"
+                            required />
+                        <span class="err" id="err_last_name"></span>
+                    </div>
+                </div>
+
+                <div class="form-row two-col">
+                    <div class="form-group">
+                        <label for="email">Email address <span class="req">*</span></label>
+                        <input type="email" id="email" name="email" maxlength="120" autocomplete="email" required />
+                        <span class="err" id="err_email"></span>
+                    </div>
+                    <div class="form-group">
+                        <label for="phone">Mobile number <span class="opt">(optional)</span></label>
+                        <input type="tel" id="phone" name="phone" maxlength="30" autocomplete="tel"
+                            placeholder="+39 333 …" />
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Rating <span class="opt">(optional)</span></label>
+                    <div class="stars" role="radiogroup" aria-label="Rating">
+                        <input type="radio" id="s5" name="rating" value="5" /><label for="s5"
+                            title="5 – Excellent">★</label>
+                        <input type="radio" id="s4" name="rating" value="4" /><label for="s4" title="4 – Good">★</label>
+                        <input type="radio" id="s3" name="rating" value="3" /><label for="s3"
+                            title="3 – Average">★</label>
+                        <input type="radio" id="s2" name="rating" value="2" /><label for="s2" title="2 – Poor">★</label>
+                        <input type="radio" id="s1" name="rating" value="1" /><label for="s1"
+                            title="1 – Very poor">★</label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="feedback">Feedback <span class="req">*</span></label>
+                    <textarea id="feedback" name="feedback" rows="6" maxlength="5000" required
+                        placeholder="Tell us what works well, what could be improved, or any issues you encountered…"></textarea>
+                    <span class="char-count"><span id="charCount">0</span> / 5000</span>
+                    <span class="err" id="err_feedback"></span>
+                </div>
+
+                <div id="formError" class="alert alert-error" style="display:none"></div>
+
+                <button type="submit" id="submitBtn">
+                    <span id="btnText">Send Feedback</span>
+                    <span id="btnSpinner" class="spinner" style="display:none"></span>
+                </button>
+            </form>
+
+            <div id="successPanel" class="success-panel" style="display:none">
+                <div class="success-icon">✓</div>
+                <h2>Thank you!</h2>
+                <p>Your feedback has been received. We appreciate you taking the time.</p>
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        <p>Heidelberg Engineering · AppWay &nbsp;·&nbsp; <a href="https://www.heidelbergengineering.com" target="_blank"
+                rel="noopener">heidelbergengineering.com</a></p>
+    </footer>
+
+    <script src="config.js"></script>
+    <script src="app.js"></script>
+</body>
+
+</html>

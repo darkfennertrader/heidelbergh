@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AppWay Clinician Feedback – S3 + CloudFront + API Gateway HTTP API + Lambda (SES)
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  DeployBucket:
+    Type: String
+    Description: S3 bucket that holds the Lambda zip (created by deploy.sh)
+
+  LambdaKey:
+    Type: String
+    Default: lambda.zip
+    Description: S3 key of the Lambda deployment package
+
+  ToAddresses:
+    Type: String
+    Description: Comma-separated list of recipient email addresses
+
+  FromAddress:
+    Type: String
+    Description: SES-verified sender email address
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── S3 site bucket ────────────────────────────────────────────────────────
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "appway-feedback-site-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: appway-feedback
+
+  # ── CloudFront Origin Access Control ──────────────────────────────────────
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "appway-feedback-oac-${AWS::AccountId}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ── S3 bucket policy – only CloudFront may read ───────────────────────────
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  # ── CloudFront distribution ───────────────────────────────────────────────
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Comment: AppWay Clinician Feedback
+        HttpVersion: http2
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOAC.Id
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+      Tags:
+        - Key: Project
+          Value: appway-feedback
+
+  # ── Lambda execution role ──────────────────────────────────────────────────
+  LambdaExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "appway-feedback-lambda-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SESAndLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SendEmail
+                Effect: Allow
+                Action: ses:SendEmail
+                Resource: "*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/appway-feedback-*"
+      Tags:
+        - Key: Project
+          Value: appway-feedback
+
+  # ── Lambda function ────────────────────────────────────────────────────────
+  FeedbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: appway-feedback-submit
+      Runtime: python3.12
+      Handler: submit_feedback.lambda_handler
+      Role: !GetAtt LambdaExecRole.Arn
+      Timeout: 15
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaKey
+      Environment:
+        Variables:
+          FEEDBACK_TO_ADDRESSES: !Ref ToAddresses
+          FEEDBACK_FROM_ADDRESS: !Ref FromAddress
+      Tags:
+        - Key: Project
+          Value: appway-feedback
+
+  # ── API Gateway HTTP API ───────────────────────────────────────────────────
+  FeedbackApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: appway-feedback-api
+      ProtocolType: HTTP
+      Description: AppWay Clinician Feedback API
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub "https://${SiteDistribution.DomainName}"
+          - "http://localhost:8000"
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [Content-Type]
+        MaxAge: 3600
+
+  FeedbackIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref FeedbackApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt FeedbackFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  FeedbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref FeedbackApi
+      RouteKey: "POST /feedback"
+      Target: !Sub "integrations/${FeedbackIntegration}"
+
+  FeedbackStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref FeedbackApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  # Allow API GW to invoke Lambda
+  ApiGwLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FeedbackFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FeedbackApi}/*/*/feedback"
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  SiteBucket:
+    Description: S3 bucket containing the static site files
+    Value: !Ref SiteBucket
+
+  DistributionId:
+    Description: CloudFront distribution ID (needed for cache invalidation)
+    Value: !Ref SiteDistribution
+
+  SiteURL:
+    Description: Public URL of the feedback page
+    Value: !Sub "https://${SiteDistribution.DomainName}"
+
+  ApiURL:
+    Description: API Gateway endpoint (injected into index.html by deploy.sh)
+    Value: !Sub "https://${FeedbackApi}.execute-api.${AWS::Region}.amazonaws.com"
